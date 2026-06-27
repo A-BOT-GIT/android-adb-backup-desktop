@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Callable
+
+from .models import AppInfo, Device
+
+
+class AdbError(RuntimeError):
+    pass
+
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def parse_devices(output: str) -> list[Device]:
+    devices: list[Device] = []
+    for line in output.splitlines()[1:]:
+        line = line.strip()
+        if not line or line.startswith("*"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        description = " ".join(parts[2:])
+        devices.append(Device(serial=serial, state=state, description=description))
+    return devices
+
+
+def parse_package_lines(output: str) -> dict[str, list[str]]:
+    packages: dict[str, list[str]] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("package:"):
+            continue
+        payload = line.removeprefix("package:")
+        if "=" in payload:
+            path, package = payload.rsplit("=", 1)
+        else:
+            path, package = "", payload
+        if package:
+            packages.setdefault(package, [])
+            if path:
+                packages[package].append(path)
+    return packages
+
+
+def parse_pm_path_lines(output: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("package:"):
+            path = line.removeprefix("package:")
+            if path:
+                paths.append(path)
+    return paths
+
+
+def parse_dumpsys_package(output: str) -> tuple[str, str]:
+    version_name = ""
+    version_code = ""
+
+    version_name_match = re.search(r"\bversionName=([^\s]+)", output)
+    if version_name_match:
+        version_name = version_name_match.group(1)
+
+    version_code_match = re.search(r"\bversionCode=(\d+)", output)
+    if version_code_match:
+        version_code = version_code_match.group(1)
+    else:
+        legacy_match = re.search(r"\bversionCode=(\d+)\s+", output)
+        if legacy_match:
+            version_code = legacy_match.group(1)
+
+    return version_name, version_code
+
+
+def _apk_label_and_version(apk_path: Path) -> tuple[str, str, str]:
+    try:
+        from apkutils2 import APK  # type: ignore
+    except Exception:
+        return "", "", ""
+
+    try:
+        apk = APK(str(apk_path))
+        manifest = apk.get_manifest()
+        label = apk.get_app_name() or ""
+        version_name = manifest.get("@android:versionName", "") or ""
+        version_code = manifest.get("@android:versionCode", "") or ""
+        return str(label), str(version_name), str(version_code)
+    except Exception:
+        return "", "", ""
+
+
+class AdbClient:
+    def __init__(self, adb_path: str = "adb", serial: str | None = None) -> None:
+        self.adb_path = adb_path or "adb"
+        self.serial = serial
+
+    def _base_args(self) -> list[str]:
+        args = [self.adb_path]
+        if self.serial:
+            args.extend(["-s", self.serial])
+        return args
+
+    def _run(
+        self,
+        args: list[str],
+        *,
+        timeout: int | None = 60,
+        text: bool = True,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess:
+        command = self._base_args() + args
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=text,
+                timeout=timeout,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except FileNotFoundError as exc:
+            raise AdbError(f"ADB not found: {self.adb_path}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise AdbError(f"ADB command timed out: {' '.join(command)}") from exc
+
+        if check and completed.returncode != 0:
+            stderr = completed.stderr if isinstance(completed.stderr, str) else completed.stderr.decode(errors="replace")
+            stdout = completed.stdout if isinstance(completed.stdout, str) else completed.stdout.decode(errors="replace")
+            message = (stderr or stdout or "unknown ADB error").strip()
+            raise AdbError(message)
+        return completed
+
+    def ensure_available(self) -> None:
+        if self.adb_path != "adb" and not Path(self.adb_path).exists():
+            raise AdbError(f"ADB path does not exist: {self.adb_path}")
+        if self.adb_path == "adb" and shutil.which("adb") is None:
+            raise AdbError("adb was not found in PATH. Select adb.exe from Android platform-tools.")
+        self._run(["version"], timeout=10)
+
+    def devices(self) -> list[Device]:
+        result = self._run(["devices", "-l"], timeout=15)
+        return parse_devices(result.stdout)
+
+    def shell(self, *args: str, timeout: int | None = 60, check: bool = True) -> str:
+        result = self._run(["shell", *args], timeout=timeout, check=check)
+        return result.stdout
+
+    def list_apps(
+        self,
+        *,
+        include_system: bool = False,
+        progress: Callable[[str], None] | None = None,
+    ) -> list[AppInfo]:
+        package_args = ["shell", "pm", "list", "packages", "-f"]
+        if not include_system:
+            package_args.append("-3")
+        package_map = parse_package_lines(self._run(package_args, timeout=60).stdout)
+        apps: list[AppInfo] = []
+
+        for index, (package, apk_paths) in enumerate(sorted(package_map.items()), start=1):
+            if progress:
+                progress(f"Reading metadata {index}/{len(package_map)}: {package}")
+            full_apk_paths = self.apk_paths(package) or apk_paths
+            version_name, version_code = self.package_version(package)
+            name = package
+
+            label, apk_version_name, apk_version_code = self._read_label_from_apk(package, full_apk_paths)
+            if label:
+                name = label
+            if apk_version_name:
+                version_name = apk_version_name
+            if apk_version_code:
+                version_code = apk_version_code
+
+            apps.append(
+                AppInfo(
+                    package=package,
+                    name=name,
+                    version_name=version_name,
+                    version_code=version_code,
+                    apk_paths=full_apk_paths,
+                    is_system=not self._is_third_party(package),
+                )
+            )
+        return apps
+
+    def package_version(self, package: str) -> tuple[str, str]:
+        output = self.shell("dumpsys", "package", package, timeout=30, check=False)
+        return parse_dumpsys_package(output)
+
+    def apk_paths(self, package: str) -> list[str]:
+        return parse_pm_path_lines(self.shell("pm", "path", package, timeout=20, check=False))
+
+    def pull(self, remote: str, local: Path, timeout: int | None = None) -> None:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        self._run(["pull", remote, str(local)], timeout=timeout)
+
+    def push(self, local: Path, remote: str, timeout: int | None = None) -> None:
+        self._run(["push", str(local), remote], timeout=timeout)
+
+    def install(self, apk_files: list[Path]) -> None:
+        if not apk_files:
+            raise AdbError("No APK files to install.")
+        if len(apk_files) == 1:
+            self._run(["install", "-r", str(apk_files[0])], timeout=None)
+            return
+        self._run(["install-multiple", "-r", *[str(path) for path in apk_files]], timeout=None)
+
+    def adb_backup_package(self, package: str, output_file: Path, *, include_apk: bool = False) -> None:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        apk_flag = "-apk" if include_apk else "-noapk"
+        self._run(["backup", "-f", str(output_file), apk_flag, package], timeout=180)
+
+    def adb_restore(self, backup_file: Path) -> None:
+        self._run(["restore", str(backup_file)], timeout=None)
+
+    def export_run_as_data(self, package: str, output_tar: Path) -> bool:
+        output_tar.parent.mkdir(parents=True, exist_ok=True)
+        command = self._base_args() + [
+            "exec-out",
+            "run-as",
+            package,
+            "tar",
+            "-cf",
+            "-",
+            "-C",
+            f"/data/data/{package}",
+            ".",
+        ]
+        try:
+            with output_tar.open("wb") as fh:
+                completed = subprocess.run(
+                    command,
+                    stdout=fh,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+        except Exception:
+            output_tar.unlink(missing_ok=True)
+            return False
+        if completed.returncode != 0 or output_tar.stat().st_size < 1024:
+            output_tar.unlink(missing_ok=True)
+            return False
+        return True
+
+    def path_exists(self, remote_path: str) -> bool:
+        result = self.shell("test", "-e", remote_path, "&&", "echo", "yes", timeout=15, check=False)
+        return "yes" in result
+
+    def _read_label_from_apk(self, package: str, apk_paths: list[str]) -> tuple[str, str, str]:
+        if not apk_paths:
+            return "", "", ""
+        with tempfile.TemporaryDirectory(prefix="adb-apk-meta-") as tmp:
+            local_apk = Path(tmp) / f"{package}.apk"
+            try:
+                self.pull(apk_paths[0], local_apk, timeout=90)
+            except AdbError:
+                return "", "", ""
+            return _apk_label_and_version(local_apk)
+
+    def _is_third_party(self, package: str) -> bool:
+        output = self.shell("pm", "list", "packages", "-3", package, timeout=15, check=False)
+        return package in output
