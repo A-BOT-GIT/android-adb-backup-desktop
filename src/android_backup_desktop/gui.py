@@ -262,16 +262,16 @@ class MainWindow(QMainWindow):
             checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             checkbox_item.setCheckState(Qt.CheckState.Unchecked)
             self.table.setItem(row, 0, checkbox_item)
-            self.table.setItem(row, 1, QTableWidgetItem(app.name))
-            self.table.setItem(row, 2, QTableWidgetItem(app.package))
-            self.table.setItem(row, 3, QTableWidgetItem(app.display_version))
-            self.table.setItem(row, 4, QTableWidgetItem(str(len(app.apk_paths))))
+            self.table.setItem(row, 1, QTableWidgetItem(app.name or ""))
+            self.table.setItem(row, 2, QTableWidgetItem(app.package or ""))
+            self.table.setItem(row, 3, QTableWidgetItem(app.display_version or ""))
+            self.table.setItem(row, 4, QTableWidgetItem(str(len(app.apk_paths or []))))
         self.apply_filter(self.search_box.text())
 
     def apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
         for row, app in enumerate(self.apps):
-            visible = not needle or needle in " ".join([app.name, app.package, app.display_version]).lower()
+            visible = not needle or needle in " ".join([app.name or "", app.package or "", app.display_version or ""]).lower()
             self.table.setRowHidden(row, not visible)
 
     def set_all_checked(self, checked: bool) -> None:

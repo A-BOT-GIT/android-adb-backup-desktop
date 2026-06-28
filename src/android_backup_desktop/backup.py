@@ -68,10 +68,10 @@ class BackupService:
 
                 manifest["apps"].append(
                     {
-                        "package": app.package,
-                        "name": app.name,
-                        "version_name": app.version_name,
-                        "version_code": app.version_code,
+                        "package": app.package or "",
+                        "name": app.name or "",
+                        "version_name": app.version_name or "",
+                        "version_code": app.version_code or "",
                         "apk_files": apk_files,
                         "data_files": data_files,
                         "obb_files": obb_files,
