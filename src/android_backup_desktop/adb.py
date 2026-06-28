@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import re
 import shutil
 import subprocess
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Callable
 
 from .models import AppInfo, Device
+
+
+logger = logging.getLogger(__name__)
 
 
 class AdbError(RuntimeError):
@@ -26,26 +30,53 @@ def _is_default_adb_path(adb_path: str) -> bool:
 
 def _resource_base_dir() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).resolve().parents[2]
+        base_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)).resolve()
+        logger.debug(
+            "Resolving ADB resource base for frozen app: frozen=%s, _MEIPASS=%r, executable=%s, base=%s",
+            getattr(sys, "frozen", False),
+            getattr(sys, "_MEIPASS", None),
+            sys.executable,
+            base_dir,
+        )
+        return base_dir
+
+    base_dir = Path(__file__).resolve().parents[2]
+    logger.debug("Resolving ADB resource base for source run: file=%s, base=%s", __file__, base_dir)
+    return base_dir
 
 
 def _bundled_adb_candidates() -> list[Path]:
     base_dir = _resource_base_dir()
-    candidates = [
+    candidates: list[Path] = [
         base_dir / "tools" / "adb" / "adb.exe",
+        Path.cwd() / "tools" / "adb" / "adb.exe",
     ]
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "tools" / "adb" / "adb.exe")
-    return candidates
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates.extend(
+            [
+                executable_dir / "tools" / "adb" / "adb.exe",
+                executable_dir / "_internal" / "tools" / "adb" / "adb.exe",
+            ]
+        )
+
+    unique_candidates = list(dict.fromkeys(candidate.resolve() for candidate in candidates))
+    logger.debug("Bundled ADB candidate paths: %s", [str(candidate) for candidate in unique_candidates])
+    return unique_candidates
 
 
 def resolve_adb_path(adb_path: str = "adb") -> str:
     requested_path = adb_path or "adb"
-    if os.name == "nt" and _is_default_adb_path(requested_path):
+    logger.debug("Resolving ADB path: requested=%r, os.name=%s", requested_path, os.name)
+    if _is_default_adb_path(requested_path):
         for candidate in _bundled_adb_candidates():
+            logger.debug("Checking bundled ADB candidate: path=%s, exists=%s", candidate, candidate.exists())
             if candidate.exists():
+                logger.debug("Resolved ADB path to bundled executable: %s", candidate)
                 return str(candidate)
+    else:
+        logger.debug("Skipping bundled ADB lookup because requested path is explicit: %r", requested_path)
+    logger.debug("Falling back to requested ADB path: %r", requested_path)
     return requested_path
 
 
@@ -176,7 +207,8 @@ class AdbClient:
 
     def ensure_available(self) -> None:
         if _looks_like_file_path(self.adb_path) and not Path(self.adb_path).exists():
-            raise AdbError(f"ADB 路径不存在：{self.adb_path}")
+            tried_paths = [str(c) for c in _bundled_adb_candidates()]
+            raise AdbError(f"ADB 路径不存在：{self.adb_path}\n尝试过的bundled路径：{', '.join(tried_paths)}")
         if not _looks_like_file_path(self.adb_path) and shutil.which(self.adb_path) is None:
             raise AdbError("在 PATH 中未找到 adb。请从 Android platform-tools 中选择 adb.exe。")
         self._run(["version"], timeout=10)
