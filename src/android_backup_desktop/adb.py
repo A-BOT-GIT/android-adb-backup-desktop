@@ -239,6 +239,8 @@ class AdbClient:
                 command,
                 capture_output=True,
                 text=text,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 creationflags=CREATE_NO_WINDOW,
             )

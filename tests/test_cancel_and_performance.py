@@ -73,6 +73,8 @@ class CountingAdbClient(AdbClient):
         self.serial = None
         self.run_calls: list[list[str]] = []
         self.shell_calls: list[tuple[str, ...]] = []
+        self.adb_path = Path("adb")
+        self.serial = None
 
     def _run(self, args: list[str], **kwargs):  # type: ignore[override]
         self.run_calls.append(args)
@@ -175,6 +177,35 @@ def test_load_app_metadata_uses_localized_name_when_apk_reader_provides_it() -> 
     assert app.name == "Example"
     assert app.localized_name == "示例应用"
     assert app.display_name == "示例应用"
+
+
+def test_run_forces_utf8_subprocess_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    from android_backup_desktop import adb as adb_module
+
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+        class Result:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(adb_module.subprocess, "run", fake_run)
+    client = AdbClient.__new__(AdbClient)
+    client.adb_path = Path("adb")
+    client.serial = None
+
+    result = client._run(["version"])
+
+    assert result.stdout == "ok"
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["encoding"] == "utf-8"
+    assert captured["kwargs"]["errors"] == "replace"
 
 
 def test_device_refresh_is_dispatched_to_background_worker(monkeypatch: pytest.MonkeyPatch) -> None:
