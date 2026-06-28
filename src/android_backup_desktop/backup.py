@@ -90,11 +90,21 @@ class BackupService:
 
         loaded_apps: list[AppInfo] = []
         for index, app in enumerate(apps, start=1):
+            self._check_cancel()
             if app.metadata_loaded:
                 loaded_apps.append(app)
             else:
                 self._log(log, f"正在加载应用元数据 {index}/{len(apps)}：{app.package}")
-                loaded_apps.append(self.adb.load_app_metadata(app))
+                loaded_app = self.adb.load_app_metadata(app)
+                # 验证元数据字段非空
+                if not loaded_app.name:
+                    loaded_app.name = loaded_app.package
+                if not loaded_app.version_name:
+                    loaded_app.version_name = ""
+                if not loaded_app.version_code:
+                    loaded_app.version_code = ""
+                loaded_app.metadata_loaded = True
+                loaded_apps.append(loaded_app)
 
         with tempfile.TemporaryDirectory(prefix="android-app-backup-") as tmp_name:
             staging = Path(tmp_name)
@@ -262,7 +272,8 @@ class BackupService:
                         self._log(log, f"正在通过 adb 恢复 {ab_file.name} 大小={size}B；如设备提示，请在设备上确认。")
                         self.adb.adb_restore(ab_file)
 
-                self.completed_apps.append(package)
+                with self._completed_lock:
+                    self.completed_apps.append(package)
                 elapsed = time.perf_counter() - app_start
                 self._log(log, f"完成恢复应用 {index}/{len(apps)}：{package} 耗时={elapsed:.2f}s")
                 if progress:
