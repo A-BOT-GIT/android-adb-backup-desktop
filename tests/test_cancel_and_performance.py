@@ -207,10 +207,12 @@ def test_long_adb_operations_use_bounded_timeouts(monkeypatch: pytest.MonkeyPatc
     client.adb_path = "adb"
     client.serial = None
     monkeypatch.setattr(subprocess, "run", fake_run)
+    (tmp_path / "backup.ab").write_bytes(b"data")
 
     client.pull("/sdcard/file.bin", tmp_path / "file.bin")
     client.push(tmp_path / "file.bin", "/sdcard/file.bin")
     client.install([tmp_path / "app.apk"])
     client.adb_restore(tmp_path / "backup.ab")
+    client.restore_run_as_data("com.example.app", tmp_path / "backup.ab")
 
-    assert [timeout for _, timeout in captured] == [LONG_ADB_OPERATION_TIMEOUT] * 4
+    assert [timeout for _, timeout in captured] == [LONG_ADB_OPERATION_TIMEOUT] * 5

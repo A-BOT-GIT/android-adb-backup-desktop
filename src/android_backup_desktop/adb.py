@@ -379,6 +379,53 @@ class AdbClient:
     def adb_restore(self, backup_file: Path) -> None:
         self._run(["restore", str(backup_file)], timeout=LONG_ADB_OPERATION_TIMEOUT)
 
+    def restore_run_as_data(self, package: str, input_tar: Path) -> None:
+        command = self._base_args() + [
+            "exec-in",
+            "run-as",
+            package,
+            "tar",
+            "-xf",
+            "-",
+            "-C",
+            f"/data/data/{package}",
+        ]
+        command_text = " ".join(str(part) for part in command)
+        start = time.perf_counter()
+        logger.info("ADB begin: %s timeout=%s stdin=%s", command_text, LONG_ADB_OPERATION_TIMEOUT, input_tar)
+        try:
+            with input_tar.open("rb") as fh:
+                completed = subprocess.run(
+                    command,
+                    stdin=fh,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=LONG_ADB_OPERATION_TIMEOUT,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+        except FileNotFoundError as exc:
+            logger.exception("ADB failed: %s", command_text)
+            raise AdbError(f"未找到 ADB：{self.adb_path}") from exc
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.perf_counter() - start
+            logger.exception("ADB timeout after %.2fs: %s", elapsed, command_text)
+            raise AdbError(f"ADB 命令超时：{' '.join(command)}") from exc
+
+        elapsed = time.perf_counter() - start
+        stdout = completed.stdout.decode(errors="replace") if isinstance(completed.stdout, bytes) else str(completed.stdout)
+        stderr = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr)
+        logger.info(
+            "ADB end: %s returncode=%s elapsed=%.2fs stdout_len=%d stderr_len=%d",
+            command_text,
+            completed.returncode,
+            elapsed,
+            len(stdout),
+            len(stderr),
+        )
+        if completed.returncode != 0:
+            message = (stderr or stdout or "未知 ADB 错误").strip()
+            raise AdbError(message)
+
     def export_run_as_data(self, package: str, output_tar: Path) -> bool:
         output_tar.parent.mkdir(parents=True, exist_ok=True)
         command = self._base_args() + [
