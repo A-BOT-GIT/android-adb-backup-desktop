@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -16,6 +17,41 @@ class AdbError(RuntimeError):
 
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+DEFAULT_ADB_NAMES = {"adb", "adb.exe"}
+
+
+def _is_default_adb_path(adb_path: str) -> bool:
+    return adb_path.strip().lower() in DEFAULT_ADB_NAMES
+
+
+def _resource_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parents[2]
+
+
+def _bundled_adb_candidates() -> list[Path]:
+    base_dir = _resource_base_dir()
+    candidates = [
+        base_dir / "tools" / "adb" / "adb.exe",
+    ]
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "tools" / "adb" / "adb.exe")
+    return candidates
+
+
+def resolve_adb_path(adb_path: str = "adb") -> str:
+    requested_path = adb_path or "adb"
+    if os.name == "nt" and _is_default_adb_path(requested_path):
+        for candidate in _bundled_adb_candidates():
+            if candidate.exists():
+                return str(candidate)
+    return requested_path
+
+
+def _looks_like_file_path(adb_path: str) -> bool:
+    path = Path(adb_path)
+    return path.is_absolute() or any(separator in adb_path for separator in (os.sep, os.altsep) if separator)
 
 
 def parse_devices(output: str) -> list[Device]:
@@ -100,7 +136,7 @@ def _apk_label_and_version(apk_path: Path) -> tuple[str, str, str]:
 
 class AdbClient:
     def __init__(self, adb_path: str = "adb", serial: str | None = None) -> None:
-        self.adb_path = adb_path or "adb"
+        self.adb_path = resolve_adb_path(adb_path)
         self.serial = serial
 
     def _base_args(self) -> list[str]:
@@ -127,22 +163,22 @@ class AdbClient:
                 creationflags=CREATE_NO_WINDOW,
             )
         except FileNotFoundError as exc:
-            raise AdbError(f"ADB not found: {self.adb_path}") from exc
+            raise AdbError(f"未找到 ADB：{self.adb_path}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise AdbError(f"ADB command timed out: {' '.join(command)}") from exc
+            raise AdbError(f"ADB 命令超时：{' '.join(command)}") from exc
 
         if check and completed.returncode != 0:
             stderr = completed.stderr if isinstance(completed.stderr, str) else completed.stderr.decode(errors="replace")
             stdout = completed.stdout if isinstance(completed.stdout, str) else completed.stdout.decode(errors="replace")
-            message = (stderr or stdout or "unknown ADB error").strip()
+            message = (stderr or stdout or "未知 ADB 错误").strip()
             raise AdbError(message)
         return completed
 
     def ensure_available(self) -> None:
-        if self.adb_path != "adb" and not Path(self.adb_path).exists():
-            raise AdbError(f"ADB path does not exist: {self.adb_path}")
-        if self.adb_path == "adb" and shutil.which("adb") is None:
-            raise AdbError("adb was not found in PATH. Select adb.exe from Android platform-tools.")
+        if _looks_like_file_path(self.adb_path) and not Path(self.adb_path).exists():
+            raise AdbError(f"ADB 路径不存在：{self.adb_path}")
+        if not _looks_like_file_path(self.adb_path) and shutil.which(self.adb_path) is None:
+            raise AdbError("在 PATH 中未找到 adb。请从 Android platform-tools 中选择 adb.exe。")
         self._run(["version"], timeout=10)
 
     def devices(self) -> list[Device]:
@@ -167,7 +203,7 @@ class AdbClient:
 
         for index, (package, apk_paths) in enumerate(sorted(package_map.items()), start=1):
             if progress:
-                progress(f"Reading metadata {index}/{len(package_map)}: {package}")
+                progress(f"正在读取元数据 {index}/{len(package_map)}：{package}")
             full_apk_paths = self.apk_paths(package) or apk_paths
             version_name, version_code = self.package_version(package)
             name = package
@@ -208,7 +244,7 @@ class AdbClient:
 
     def install(self, apk_files: list[Path]) -> None:
         if not apk_files:
-            raise AdbError("No APK files to install.")
+            raise AdbError("没有可安装的 APK 文件。")
         if len(apk_files) == 1:
             self._run(["install", "-r", str(apk_files[0])], timeout=None)
             return

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -49,7 +48,7 @@ class AppLoadWorker(QObject):
             apps = adb.list_apps(include_system=self.include_system, progress=self.log.emit)
             self.finished.emit(apps)
         except Exception as exc:
-            self.failed.emit(f"{exc}\n{traceback.format_exc()}")
+            self.failed.emit(str(exc) or "加载应用失败。")
 
 
 class BackupWorker(QObject):
@@ -76,7 +75,7 @@ class BackupWorker(QObject):
             )
             self.finished.emit(str(zip_path))
         except Exception as exc:
-            self.failed.emit(f"{exc}\n{traceback.format_exc()}")
+            self.failed.emit(str(exc) or "备份失败。")
 
 
 class RestoreWorker(QObject):
@@ -103,13 +102,13 @@ class RestoreWorker(QObject):
             )
             self.finished.emit()
         except Exception as exc:
-            self.failed.emit(f"{exc}\n{traceback.format_exc()}")
+            self.failed.emit(str(exc) or "恢复失败。")
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Android Backup Desktop")
+        self.setWindowTitle("安卓 ADB 备份工具")
         self.resize(1080, 720)
 
         self.devices: list[Device] = []
@@ -117,32 +116,32 @@ class MainWindow(QMainWindow):
         self.worker_thread: QThread | None = None
 
         self.adb_path = QLineEdit("adb")
-        self.adb_path.setPlaceholderText("adb or path to adb.exe")
-        self.browse_adb_button = QPushButton("Browse")
-        self.refresh_devices_button = QPushButton("Refresh Devices")
+        self.adb_path.setPlaceholderText("adb 或 adb.exe 的完整路径")
+        self.browse_adb_button = QPushButton("浏览")
+        self.refresh_devices_button = QPushButton("刷新设备")
         self.device_combo = QComboBox()
 
-        self.include_system = QCheckBox("Show system apps")
-        self.include_data = QCheckBox("Include app data when allowed")
-        self.include_obb = QCheckBox("Include OBB files")
+        self.include_system = QCheckBox("显示系统应用")
+        self.include_data = QCheckBox("在允许时包含应用数据")
+        self.include_obb = QCheckBox("包含 OBB 文件")
         self.include_obb.setChecked(True)
-        self.restore_data = QCheckBox("Restore .ab data when present")
+        self.restore_data = QCheckBox("存在 .ab 数据时恢复")
         self.restore_data.setChecked(True)
 
         self.output_dir = QLineEdit(str(Path.home() / "AndroidBackups"))
-        self.browse_output_button = QPushButton("Browse")
+        self.browse_output_button = QPushButton("浏览")
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Filter by package, app name, or version")
-        self.refresh_apps_button = QPushButton("Load Apps")
-        self.select_all_button = QPushButton("Select All")
-        self.clear_button = QPushButton("Clear")
-        self.backup_selected_button = QPushButton("Backup Selected")
-        self.backup_all_button = QPushButton("Backup All")
-        self.restore_button = QPushButton("Restore Zip")
+        self.search_box.setPlaceholderText("按包名、应用名称或版本筛选")
+        self.refresh_apps_button = QPushButton("加载应用")
+        self.select_all_button = QPushButton("全选")
+        self.clear_button = QPushButton("清除")
+        self.backup_selected_button = QPushButton("备份选中")
+        self.backup_all_button = QPushButton("备份全部")
+        self.restore_button = QPushButton("恢复备份")
 
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Backup", "App", "Package", "Version", "APK count"])
+        self.table.setHorizontalHeaderLabels(["备份", "应用", "包名", "版本", "APK 数量"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -150,7 +149,7 @@ class MainWindow(QMainWindow):
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("就绪")
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
 
@@ -162,19 +161,19 @@ class MainWindow(QMainWindow):
         root = QWidget()
         layout = QVBoxLayout(root)
 
-        adb_group = QGroupBox("Connection")
+        adb_group = QGroupBox("连接")
         adb_layout = QGridLayout(adb_group)
         adb_layout.addWidget(QLabel("ADB"), 0, 0)
         adb_layout.addWidget(self.adb_path, 0, 1)
         adb_layout.addWidget(self.browse_adb_button, 0, 2)
-        adb_layout.addWidget(QLabel("Device"), 1, 0)
+        adb_layout.addWidget(QLabel("设备"), 1, 0)
         adb_layout.addWidget(self.device_combo, 1, 1)
         adb_layout.addWidget(self.refresh_devices_button, 1, 2)
         layout.addWidget(adb_group)
 
-        options_group = QGroupBox("Backup Options")
+        options_group = QGroupBox("备份选项")
         options_layout = QGridLayout(options_group)
-        options_layout.addWidget(QLabel("Output"), 0, 0)
+        options_layout.addWidget(QLabel("输出目录"), 0, 0)
         options_layout.addWidget(self.output_dir, 0, 1)
         options_layout.addWidget(self.browse_output_button, 0, 2)
         options_layout.addWidget(self.include_system, 1, 0)
@@ -213,12 +212,12 @@ class MainWindow(QMainWindow):
         self.search_box.textChanged.connect(self.apply_filter)
 
     def browse_adb(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select adb.exe", str(Path.home()), "ADB (adb.exe adb);;All files (*)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择 adb.exe", str(Path.home()), "ADB (adb.exe adb);;所有文件 (*)")
         if file_name:
             self.adb_path.setText(file_name)
 
     def browse_output(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "Select backup output folder", self.output_dir.text())
+        directory = QFileDialog.getExistingDirectory(self, "选择备份输出文件夹", self.output_dir.text())
         if directory:
             self.output_dir.setText(directory)
 
@@ -234,14 +233,14 @@ class MainWindow(QMainWindow):
         self.device_combo.clear()
         for device in self.devices:
             self.device_combo.addItem(device.display_name, device.serial)
-        self.log(f"Found {len(self.devices)} device(s).")
+        self.log(f"找到 {len(self.devices)} 台设备。")
 
     def load_apps(self) -> None:
         serial = self.current_serial()
         if not serial:
-            self.show_error("Connect and select an ADB device first.")
+            self.show_error("请先连接并选择一台 ADB 设备。")
             return
-        self.set_busy(True, "Loading apps...")
+        self.set_busy(True, "正在加载应用...")
         worker = AppLoadWorker(self.adb_path.text().strip() or "adb", serial, self.include_system.isChecked())
         self.start_worker(worker, worker.run)
         worker.log.connect(self.log)
@@ -251,7 +250,7 @@ class MainWindow(QMainWindow):
     def on_apps_loaded(self, apps: list[AppInfo]) -> None:
         self.apps = apps
         self.populate_table()
-        self.set_busy(False, f"Loaded {len(apps)} apps.")
+        self.set_busy(False, f"已加载 {len(apps)} 个应用。")
 
     def populate_table(self) -> None:
         self.table.setRowCount(0)
@@ -292,11 +291,11 @@ class MainWindow(QMainWindow):
     def start_backup(self, all_apps: bool) -> None:
         serial = self.current_serial()
         if not serial:
-            self.show_error("Connect and select an ADB device first.")
+            self.show_error("请先连接并选择一台 ADB 设备。")
             return
         apps = list(self.apps) if all_apps else self.selected_apps()
         if not apps:
-            self.show_error("Select at least one app to back up.")
+            self.show_error("请至少选择一个要备份的应用。")
             return
 
         options = BackupOptions(
@@ -304,7 +303,7 @@ class MainWindow(QMainWindow):
             include_data=self.include_data.isChecked(),
             include_obb=self.include_obb.isChecked(),
         )
-        self.set_busy(True, "Starting backup...")
+        self.set_busy(True, "正在开始备份...")
         worker = BackupWorker(self.adb_path.text().strip() or "adb", serial, apps, options)
         self.start_worker(worker, worker.run)
         worker.log.connect(self.log)
@@ -315,12 +314,12 @@ class MainWindow(QMainWindow):
     def start_restore(self) -> None:
         serial = self.current_serial()
         if not serial:
-            self.show_error("Connect and select an ADB device first.")
+            self.show_error("请先连接并选择一台 ADB 设备。")
             return
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select backup zip", self.output_dir.text(), "Zip archives (*.zip)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择备份压缩包", self.output_dir.text(), "压缩包 (*.zip)")
         if not file_name:
             return
-        self.set_busy(True, "Starting restore...")
+        self.set_busy(True, "正在开始恢复...")
         worker = RestoreWorker(
             self.adb_path.text().strip() or "adb",
             serial,
@@ -335,7 +334,7 @@ class MainWindow(QMainWindow):
 
     def start_worker(self, worker: QObject, run_slot) -> None:
         if self.worker_thread and self.worker_thread.isRunning():
-            self.show_error("Another operation is already running.")
+            self.show_error("已有另一个操作正在运行。")
             return
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -359,15 +358,15 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def on_backup_finished(self, zip_path: str) -> None:
-        self.set_busy(False, f"Backup completed: {zip_path}")
-        QMessageBox.information(self, "Backup completed", f"Backup archive created:\n{zip_path}")
+        self.set_busy(False, f"备份完成：{zip_path}")
+        QMessageBox.information(self, "备份完成", f"已创建备份归档：\n{zip_path}")
 
     def on_restore_finished(self) -> None:
-        self.set_busy(False, "Restore completed.")
-        QMessageBox.information(self, "Restore completed", "Restore operation finished.")
+        self.set_busy(False, "恢复完成。")
+        QMessageBox.information(self, "恢复完成", "恢复操作已完成。")
 
     def on_worker_failed(self, message: str) -> None:
-        self.set_busy(False, "Operation failed.")
+        self.set_busy(False, "操作失败。")
         self.show_error(message)
 
     def set_busy(self, busy: bool, status: str) -> None:
@@ -394,7 +393,7 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message: str) -> None:
         self.log(message)
-        QMessageBox.critical(self, "Android Backup Desktop", message)
+        QMessageBox.critical(self, "安卓 ADB 备份工具", message)
 
 
 def run_app() -> int:

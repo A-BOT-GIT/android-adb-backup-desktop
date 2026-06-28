@@ -33,7 +33,7 @@ class BackupService:
         progress: ProgressCallback | None = None,
     ) -> Path:
         if not apps:
-            raise ValueError("No apps selected for backup.")
+            raise ValueError("没有选择要备份的应用。")
 
         options.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -52,8 +52,8 @@ class BackupService:
             total_steps = len(apps)
             for index, app in enumerate(apps, start=1):
                 if progress:
-                    progress(index - 1, total_steps, f"Backing up {app.package}")
-                self._log(log, f"Backing up {app.package}")
+                    progress(index - 1, total_steps, f"正在备份 {app.package}")
+                self._log(log, f"正在备份 {app.package}")
                 app_dir = apps_dir / safe_name(app.package)
                 apk_dir = app_dir / "apk"
                 apk_files = self._backup_apks(app, apk_dir, log)
@@ -78,7 +78,7 @@ class BackupService:
                     }
                 )
                 if progress:
-                    progress(index, total_steps, f"Finished {app.package}")
+                    progress(index, total_steps, f"已完成 {app.package}")
 
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -86,7 +86,7 @@ class BackupService:
             )
             self._zip_directory(staging, zip_path)
 
-        self._log(log, f"Backup archive written: {zip_path}")
+        self._log(log, f"备份归档已写入：{zip_path}")
         return zip_path
 
     def restore_backup(
@@ -109,19 +109,19 @@ class BackupService:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             apps = manifest.get("apps", [])
             if not isinstance(apps, list):
-                raise ValueError("Invalid backup manifest.")
+                raise ValueError("备份清单无效。")
 
             for index, app_entry in enumerate(apps, start=1):
                 package = str(app_entry.get("package", ""))
                 if progress:
-                    progress(index - 1, len(apps), f"Restoring {package}")
-                self._log(log, f"Restoring {package}")
+                    progress(index - 1, len(apps), f"正在恢复 {package}")
+                self._log(log, f"正在恢复 {package}")
 
                 app_dir = staging / "apps" / safe_name(package)
                 apk_files = sorted((app_dir / "apk").glob("*.apk"))
                 if apk_files:
                     self.adb.install(apk_files)
-                    self._log(log, f"Installed APKs for {package}")
+                    self._log(log, f"已安装 {package} 的 APK")
 
                 obb_dir = app_dir / "obb"
                 if obb_dir.exists():
@@ -129,27 +129,27 @@ class BackupService:
                     self.adb.shell("mkdir", "-p", remote_obb, timeout=30, check=False)
                     for child in obb_dir.iterdir():
                         self.adb.push(child, remote_obb, timeout=None)
-                    self._log(log, f"Restored OBB files for {package}")
+                    self._log(log, f"已恢复 {package} 的 OBB 文件")
 
                 if restore_data:
                     for ab_file in sorted((app_dir / "data").glob("*.ab")):
-                        self._log(log, f"Starting adb restore for {ab_file.name}; confirm on the device if prompted.")
+                        self._log(log, f"正在通过 adb 恢复 {ab_file.name}；如设备提示，请在设备上确认。")
                         self.adb.adb_restore(ab_file)
 
                 if progress:
-                    progress(index, len(apps), f"Finished {package}")
+                    progress(index, len(apps), f"已完成 {package}")
 
     def _backup_apks(self, app: AppInfo, apk_dir: Path, log: LogCallback | None) -> list[str]:
         apk_paths = app.apk_paths or self.adb.apk_paths(app.package)
         if not apk_paths:
-            raise AdbError(f"No APK path found for {app.package}")
+            raise AdbError(f"未找到 {app.package} 的 APK 路径")
 
         apk_dir.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
         for remote_path in apk_paths:
             filename = Path(remote_path).name or "base.apk"
             local = apk_dir / filename
-            self._log(log, f"Pulling APK: {remote_path}")
+            self._log(log, f"正在拉取 APK：{remote_path}")
             self.adb.pull(remote_path, local, timeout=None)
             copied.append(str(local.relative_to(apk_dir.parent.parent.parent)))
         return copied
@@ -159,25 +159,25 @@ class BackupService:
         copied: list[str] = []
 
         run_as_tar = data_dir / "run-as-data.tar"
-        self._log(log, f"Trying run-as data export for {app.package}")
+        self._log(log, f"正在尝试通过 run-as 导出 {app.package} 的数据")
         if self.adb.export_run_as_data(app.package, run_as_tar):
-            self._log(log, f"run-as data export succeeded for {app.package}")
+            self._log(log, f"{app.package} 的 run-as 数据导出成功")
             copied.append(str(run_as_tar.relative_to(data_dir.parent.parent.parent)))
             return copied
 
         ab_file = data_dir / "adb-backup.ab"
-        self._log(log, f"Trying adb backup fallback for {app.package}; confirm on the device if prompted.")
+        self._log(log, f"正在尝试通过 adb backup 备份 {app.package}；如设备提示，请在设备上确认。")
         try:
             self.adb.adb_backup_package(app.package, ab_file, include_apk=False)
         except AdbError as exc:
-            self._log(log, f"Data backup skipped for {app.package}: {exc}")
+            self._log(log, f"已跳过 {app.package} 的数据备份：{exc}")
             ab_file.unlink(missing_ok=True)
             return copied
 
         if ab_file.exists() and ab_file.stat().st_size > 1024:
             copied.append(str(ab_file.relative_to(data_dir.parent.parent.parent)))
         else:
-            self._log(log, f"Data backup for {app.package} was empty or refused by Android.")
+            self._log(log, f"{app.package} 的数据备份为空，或已被 Android 拒绝。")
             ab_file.unlink(missing_ok=True)
         return copied
 
@@ -196,7 +196,7 @@ class BackupService:
         for remote_file in remote_files:
             relative_name = remote_file.removeprefix(remote_obb).lstrip("/")
             local = obb_dir / relative_name
-            self._log(log, f"Pulling OBB file: {remote_file}")
+            self._log(log, f"正在拉取 OBB 文件：{remote_file}")
             self.adb.pull(remote_file, local, timeout=None)
             copied.append(str(local.relative_to(obb_dir.parent.parent.parent)))
         return copied
