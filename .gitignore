@@ -20,3 +20,7 @@ backup.log
 *.pyc
 # virtual env
 # python cache
+# local agent/tool state
+.serena/
+.worktrees/
+.polly/
