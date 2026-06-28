@@ -15,3 +15,12 @@ dist/
 AndroidBackups/
 *.zip
 backup.log
+
+# build outputs
+build_artifacts/
+build/
+dist/
+*.spec
+.venv/
+__pycache__/
+*.pyc
