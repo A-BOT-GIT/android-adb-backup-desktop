@@ -244,39 +244,64 @@ class AdbClient:
         *,
         include_system: bool = False,
         progress: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[AppInfo]:
         package_args = ["shell", "pm", "list", "packages", "-f"]
         if not include_system:
             package_args.append("-3")
         package_map = parse_package_lines(self._run(package_args, timeout=60).stdout)
+        third_party_packages = set(package_map)
+        if include_system:
+            if progress:
+                progress("正在读取第三方应用集合...")
+            third_party_packages = self.third_party_packages()
         apps: list[AppInfo] = []
 
         for index, (package, apk_paths) in enumerate(sorted(package_map.items()), start=1):
+            if should_cancel and should_cancel():
+                break
             if progress:
-                progress(f"正在读取元数据 {index}/{len(package_map)}：{package}")
-            full_apk_paths = self.apk_paths(package) or apk_paths
-            version_name, version_code = self.package_version(package)
-            name = package
-
-            label, apk_version_name, apk_version_code = self._read_label_from_apk(package, full_apk_paths)
-            if label:
-                name = label
-            if apk_version_name:
-                version_name = apk_version_name
-            if apk_version_code:
-                version_code = apk_version_code
+                progress(f"正在读取应用列表 {index}/{len(package_map)}：{package}")
 
             apps.append(
                 AppInfo(
                     package=package,
-                    name=name,
-                    version_name=version_name,
-                    version_code=version_code,
-                    apk_paths=full_apk_paths,
-                    is_system=not self._is_third_party(package),
+                    name=package,
+                    version_name="",
+                    version_code="",
+                    apk_paths=apk_paths,
+                    is_system=package not in third_party_packages,
+                    metadata_loaded=False,
                 )
             )
         return apps
+
+    def third_party_packages(self) -> set[str]:
+        output = self.shell("pm", "list", "packages", "-3", timeout=60, check=False)
+        return set(parse_package_lines(output))
+
+    def load_app_metadata(self, app: AppInfo) -> AppInfo:
+        apk_paths = app.apk_paths or self.apk_paths(app.package)
+        version_name, version_code = self.package_version(app.package)
+        name = app.name or app.package
+
+        label, apk_version_name, apk_version_code = self._read_label_from_apk(app.package, apk_paths)
+        if label:
+            name = label
+        if apk_version_name:
+            version_name = apk_version_name
+        if apk_version_code:
+            version_code = apk_version_code
+
+        return AppInfo(
+            package=app.package,
+            name=name,
+            version_name=version_name,
+            version_code=version_code,
+            apk_paths=apk_paths,
+            is_system=app.is_system,
+            metadata_loaded=True,
+        )
 
     def package_version(self, package: str) -> tuple[str, str]:
         output = self.shell("dumpsys", "package", package, timeout=30, check=False)

@@ -37,9 +37,31 @@ def validate_package_name(package: str) -> bool:
     return bool(PACKAGE_RE.fullmatch(package))
 
 
+class OperationCancelled(RuntimeError):
+    def __init__(
+        self,
+        message: str = "操作已取消。",
+        *,
+        completed_apps: list[str] | None = None,
+        archive_path: Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.completed_apps = completed_apps or []
+        self.archive_path = archive_path
+
+
 class BackupService:
     def __init__(self, adb: AdbClient) -> None:
         self.adb = adb
+        self.cancel_requested = False
+        self.completed_apps: list[str] = []
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _check_cancel(self) -> None:
+        if self.cancel_requested:
+            raise OperationCancelled("操作已取消。", completed_apps=list(self.completed_apps))
 
     def backup_apps(
         self,
@@ -52,6 +74,7 @@ class BackupService:
         if not apps:
             raise ValueError("没有选择要备份的应用。")
 
+        self.completed_apps = []
         options.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         zip_path = options.output_dir / f"android-app-backup-{timestamp}.zip"
@@ -68,46 +91,85 @@ class BackupService:
                 "format": "android-backup-desktop",
                 "format_version": 1,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "status": "completed",
+                "completed_apps": [],
                 "apps": [],
             }
 
             total_steps = len(apps)
-            for index, app in enumerate(apps, start=1):
-                app_start = time.perf_counter()
-                if progress:
-                    progress(index - 1, total_steps, f"正在备份 {app.package}")
-                self._log(log, f"开始备份应用 {index}/{total_steps}：{app.package}")
-                app_dir = apps_dir / safe_name(app.package)
-                apk_dir = app_dir / "apk"
-                apk_files = self._backup_apks(app, apk_dir, log)
+            try:
+                for index, app in enumerate(apps, start=1):
+                    self._check_cancel()
+                    app_start = time.perf_counter()
+                    if progress:
+                        progress(index - 1, total_steps, f"正在备份 {app.package}")
+                    self._log(log, f"开始备份应用 {index}/{total_steps}：{app.package}")
+                    app_dir = apps_dir / safe_name(app.package)
+                    tmp_app_dir = apps_dir / ".tmp" / safe_name(app.package)
+                    if tmp_app_dir.exists():
+                        shutil.rmtree(tmp_app_dir)
+                    if app_dir.exists():
+                        shutil.rmtree(app_dir)
 
-                data_files: list[str] = []
-                if options.include_data:
-                    data_files = self._backup_data(app, app_dir / "data", log)
+                    try:
+                        apk_dir = tmp_app_dir / "apk"
+                        apk_files = self._backup_apks(app, apk_dir, log)
 
-                obb_files: list[str] = []
-                if options.include_obb:
-                    obb_files = self._backup_obb(app, app_dir / "obb", log)
+                        data_files: list[str] = []
+                        self._check_cancel()
+                        if options.include_data:
+                            data_files = self._backup_data(app, tmp_app_dir / "data", log)
 
-                manifest["apps"].append(
-                    {
-                        "package": app.package or "",
-                        "name": app.name or "",
-                        "version_name": app.version_name or "",
-                        "version_code": app.version_code or "",
-                        "apk_files": apk_files,
-                        "data_files": data_files,
-                        "obb_files": obb_files,
-                    }
+                        obb_files: list[str] = []
+                        self._check_cancel()
+                        if options.include_obb:
+                            obb_files = self._backup_obb(app, tmp_app_dir / "obb", log)
+
+                        self._check_cancel()
+                        app_dir.parent.mkdir(parents=True, exist_ok=True)
+                        tmp_app_dir.replace(app_dir)
+                    except Exception:
+                        shutil.rmtree(tmp_app_dir, ignore_errors=True)
+                        raise
+
+                    manifest["apps"].append(
+                        {
+                            "package": app.package or "",
+                            "name": app.name or "",
+                            "version_name": app.version_name or "",
+                            "version_code": app.version_code or "",
+                            "apk_files": apk_files,
+                            "data_files": data_files,
+                            "obb_files": obb_files,
+                        }
+                    )
+                    self.completed_apps.append(app.package)
+                    manifest["completed_apps"] = list(self.completed_apps)
+                    app_size = self._directory_size(app_dir)
+                    elapsed = time.perf_counter() - app_start
+                    self._log(
+                        log,
+                        f"完成备份应用 {index}/{total_steps}：{app.package} 文件={len(apk_files) + len(data_files) + len(obb_files)} 大小={app_size}B 耗时={elapsed:.2f}s",
+                    )
+                    if progress:
+                        progress(index, total_steps, f"已完成 {app.package}")
+            except OperationCancelled as exc:
+                manifest["status"] = "cancelled"
+                manifest["completed_apps"] = list(self.completed_apps)
+                shutil.rmtree(apps_dir / ".tmp", ignore_errors=True)
+                (staging / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
                 )
-                app_size = self._directory_size(app_dir)
-                elapsed = time.perf_counter() - app_start
-                self._log(
-                    log,
-                    f"完成备份应用 {index}/{total_steps}：{app.package} 文件={len(apk_files) + len(data_files) + len(obb_files)} 大小={app_size}B 耗时={elapsed:.2f}s",
-                )
+                self._zip_directory(staging, zip_path)
                 if progress:
-                    progress(index, total_steps, f"已完成 {app.package}")
+                    progress(len(self.completed_apps), total_steps, "已中断。")
+                self._log(log, f"备份已中断：已完成={len(self.completed_apps)}/{total_steps} 归档={zip_path}")
+                raise OperationCancelled(
+                    "备份已中断。",
+                    completed_apps=list(self.completed_apps),
+                    archive_path=zip_path,
+                ) from exc
 
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -131,6 +193,7 @@ class BackupService:
         if not zip_path.exists():
             raise FileNotFoundError(zip_path)
 
+        self.completed_apps = []
         operation_start = time.perf_counter()
         self._log(log, f"开始恢复：归档={zip_path} restore_data={restore_data}")
         with tempfile.TemporaryDirectory(prefix="android-app-restore-") as tmp_name:
@@ -145,6 +208,7 @@ class BackupService:
                 raise ValueError("备份清单无效。")
 
             for index, app_entry in enumerate(apps, start=1):
+                self._check_cancel()
                 app_start = time.perf_counter()
                 if not isinstance(app_entry, dict):
                     raise ValueError("备份清单中的应用条目无效。")
@@ -168,6 +232,7 @@ class BackupService:
                     remote_obb = f"/sdcard/Android/obb/{package}"
                     obb_files = sorted(path for path in obb_dir.rglob("*") if path.is_file())
                     for child in obb_files:
+                        self._check_cancel()
                         relative_parent = child.relative_to(obb_dir).parent.as_posix()
                         remote_parent = remote_obb if relative_parent == "." else f"{remote_obb}/{relative_parent}"
                         self.adb.shell("mkdir", "-p", remote_parent, timeout=30, check=False)
@@ -177,10 +242,12 @@ class BackupService:
 
                 if restore_data:
                     for ab_file in sorted((app_dir / "data").glob("*.ab")):
+                        self._check_cancel()
                         size = ab_file.stat().st_size
                         self._log(log, f"正在通过 adb 恢复 {ab_file.name} 大小={size}B；如设备提示，请在设备上确认。")
                         self.adb.adb_restore(ab_file)
 
+                self.completed_apps.append(package)
                 elapsed = time.perf_counter() - app_start
                 self._log(log, f"完成恢复应用 {index}/{len(apps)}：{package} 耗时={elapsed:.2f}s")
                 if progress:
@@ -196,6 +263,7 @@ class BackupService:
         apk_dir.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
         for remote_path in apk_paths:
+            self._check_cancel()
             filename = Path(remote_path).name or "base.apk"
             local = apk_dir / filename
             start = time.perf_counter()
@@ -203,10 +271,11 @@ class BackupService:
             self.adb.pull(remote_path, local, timeout=None)
             size = local.stat().st_size if local.exists() else 0
             self._log(log, f"完成拉取 APK：{remote_path} -> {local} 大小={size}B 耗时={time.perf_counter() - start:.2f}s")
-            copied.append(str(local.relative_to(apk_dir.parent.parent.parent)))
+            copied.append(self._backup_relative_path(local, apk_dir))
         return copied
 
     def _backup_data(self, app: AppInfo, data_dir: Path, log: LogCallback | None) -> list[str]:
+        self._check_cancel()
         data_dir.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
 
@@ -215,7 +284,7 @@ class BackupService:
         if self.adb.export_run_as_data(app.package, run_as_tar):
             size = run_as_tar.stat().st_size if run_as_tar.exists() else 0
             self._log(log, f"{app.package} 的 run-as 数据导出成功 大小={size}B")
-            copied.append(str(run_as_tar.relative_to(data_dir.parent.parent.parent)))
+            copied.append(self._backup_relative_path(run_as_tar, data_dir))
             return copied
 
         ab_file = data_dir / "adb-backup.ab"
@@ -229,7 +298,7 @@ class BackupService:
 
         if ab_file.exists() and ab_file.stat().st_size > 1024:
             self._log(log, f"{app.package} 的 adb backup 数据导出成功 大小={ab_file.stat().st_size}B")
-            copied.append(str(ab_file.relative_to(data_dir.parent.parent.parent)))
+            copied.append(self._backup_relative_path(ab_file, data_dir))
         else:
             self._log(log, f"{app.package} 的数据备份为空，或已被 Android 拒绝。")
             ab_file.unlink(missing_ok=True)
@@ -248,6 +317,7 @@ class BackupService:
         ]
         copied: list[str] = []
         for remote_file in remote_files:
+            self._check_cancel()
             relative_name = remote_file.removeprefix(remote_obb).lstrip("/")
             local = obb_dir / relative_name
             start = time.perf_counter()
@@ -255,8 +325,18 @@ class BackupService:
             self.adb.pull(remote_file, local, timeout=None)
             size = local.stat().st_size if local.exists() else 0
             self._log(log, f"完成拉取 OBB 文件：{remote_file} -> {local} 大小={size}B 耗时={time.perf_counter() - start:.2f}s")
-            copied.append(str(local.relative_to(obb_dir.parent.parent.parent)))
+            copied.append(self._backup_relative_path(local, obb_dir))
         return copied
+
+    @staticmethod
+    def _backup_relative_path(path: Path, content_dir: Path) -> str:
+        app_dir = content_dir.parent
+        if app_dir.parent.name == ".tmp":
+            staging = app_dir.parent.parent.parent
+            final_path = staging / "apps" / app_dir.name / content_dir.name / path.relative_to(content_dir)
+            return final_path.relative_to(staging).as_posix()
+        staging = app_dir.parent.parent
+        return path.relative_to(staging).as_posix()
 
     @staticmethod
     def _zip_directory(source: Path, target: Path) -> None:

@@ -27,13 +27,32 @@ from PySide6.QtWidgets import (
 )
 
 from .adb import AdbClient, AdbError
-from .backup import BackupService
+from .backup import BackupService, OperationCancelled
 from .models import AppInfo, BackupOptions, Device
+
+
+class DeviceLoadWorker(QObject):
+    finished = Signal(list)
+    failed = Signal(str)
+    log = Signal(str)
+
+    def __init__(self, adb_path: str) -> None:
+        super().__init__()
+        self.adb_path = adb_path
+
+    def run(self) -> None:
+        try:
+            adb = AdbClient(self.adb_path)
+            adb.ensure_available()
+            self.finished.emit(adb.devices())
+        except Exception as exc:
+            self.failed.emit(str(exc) or "刷新设备失败。")
 
 
 class AppLoadWorker(QObject):
     finished = Signal(list)
     failed = Signal(str)
+    cancelled = Signal(list)
     log = Signal(str)
 
     def __init__(self, adb_path: str, serial: str, include_system: bool) -> None:
@@ -41,19 +60,50 @@ class AppLoadWorker(QObject):
         self.adb_path = adb_path
         self.serial = serial
         self.include_system = include_system
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
 
     def run(self) -> None:
         try:
             adb = AdbClient(self.adb_path, self.serial)
-            apps = adb.list_apps(include_system=self.include_system, progress=self.log.emit)
+            apps = adb.list_apps(
+                include_system=self.include_system,
+                progress=self.log.emit,
+                should_cancel=lambda: self.cancel_requested,
+            )
+            if self.cancel_requested:
+                self.cancelled.emit(apps)
+                return
             self.finished.emit(apps)
         except Exception as exc:
             self.failed.emit(str(exc) or "加载应用失败。")
 
 
+class AppMetadataWorker(QObject):
+    finished = Signal(int, object)
+    failed = Signal(str)
+
+    def __init__(self, adb_path: str, serial: str, row: int, app: AppInfo) -> None:
+        super().__init__()
+        self.adb_path = adb_path
+        self.serial = serial
+        self.row = row
+        self.app = app
+
+    def run(self) -> None:
+        try:
+            adb = AdbClient(self.adb_path, self.serial)
+            self.finished.emit(self.row, adb.load_app_metadata(self.app))
+        except Exception as exc:
+            self.failed.emit(str(exc) or "读取应用元数据失败。")
+
+
 class BackupWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(list, str)
     progress = Signal(int, int, str)
     log = Signal(str)
 
@@ -63,17 +113,28 @@ class BackupWorker(QObject):
         self.serial = serial
         self.apps = apps
         self.options = options
+        self.service: BackupService | None = None
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+        if self.service:
+            self.service.request_cancel()
 
     def run(self) -> None:
         try:
-            service = BackupService(AdbClient(self.adb_path, self.serial))
-            zip_path = service.backup_apps(
+            self.service = BackupService(AdbClient(self.adb_path, self.serial))
+            if self.cancel_requested:
+                self.service.request_cancel()
+            zip_path = self.service.backup_apps(
                 self.apps,
                 self.options,
                 log=self.log.emit,
                 progress=self.progress.emit,
             )
             self.finished.emit(str(zip_path))
+        except OperationCancelled as exc:
+            self.cancelled.emit(exc.completed_apps, str(exc.archive_path or ""))
         except Exception as exc:
             self.failed.emit(str(exc) or "备份失败。")
 
@@ -81,6 +142,7 @@ class BackupWorker(QObject):
 class RestoreWorker(QObject):
     finished = Signal()
     failed = Signal(str)
+    cancelled = Signal(list)
     progress = Signal(int, int, str)
     log = Signal(str)
 
@@ -90,17 +152,28 @@ class RestoreWorker(QObject):
         self.serial = serial
         self.zip_path = zip_path
         self.restore_data = restore_data
+        self.service: BackupService | None = None
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+        if self.service:
+            self.service.request_cancel()
 
     def run(self) -> None:
         try:
-            service = BackupService(AdbClient(self.adb_path, self.serial))
-            service.restore_backup(
+            self.service = BackupService(AdbClient(self.adb_path, self.serial))
+            if self.cancel_requested:
+                self.service.request_cancel()
+            self.service.restore_backup(
                 self.zip_path,
                 restore_data=self.restore_data,
                 log=self.log.emit,
                 progress=self.progress.emit,
             )
             self.finished.emit()
+        except OperationCancelled as exc:
+            self.cancelled.emit(exc.completed_apps)
         except Exception as exc:
             self.failed.emit(str(exc) or "恢复失败。")
 
@@ -114,6 +187,8 @@ class MainWindow(QMainWindow):
         self.devices: list[Device] = []
         self.apps: list[AppInfo] = []
         self.worker_thread: QThread | None = None
+        self.metadata_thread: QThread | None = None
+        self.active_worker: QObject | None = None
 
         self.adb_path = QLineEdit("adb")
         self.adb_path.setPlaceholderText("adb 或 adb.exe 的完整路径")
@@ -139,6 +214,8 @@ class MainWindow(QMainWindow):
         self.backup_selected_button = QPushButton("备份选中")
         self.backup_all_button = QPushButton("备份全部")
         self.restore_button = QPushButton("恢复备份")
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.setVisible(False)
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["备份", "应用", "包名", "版本", "APK 数量"])
@@ -190,6 +267,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.backup_selected_button)
         toolbar.addWidget(self.backup_all_button)
         toolbar.addWidget(self.restore_button)
+        toolbar.addWidget(self.cancel_button)
         layout.addLayout(toolbar)
 
         layout.addWidget(self.table, 1)
@@ -209,7 +287,9 @@ class MainWindow(QMainWindow):
         self.backup_selected_button.clicked.connect(lambda: self.start_backup(False))
         self.backup_all_button.clicked.connect(lambda: self.start_backup(True))
         self.restore_button.clicked.connect(self.start_restore)
+        self.cancel_button.clicked.connect(self.cancel_current_operation)
         self.search_box.textChanged.connect(self.apply_filter)
+        self.table.itemSelectionChanged.connect(self.load_selected_metadata)
 
     def browse_adb(self) -> None:
         file_name, _ = QFileDialog.getOpenFileName(self, "选择 adb.exe", str(Path.home()), "ADB (adb.exe adb);;所有文件 (*)")
@@ -222,18 +302,19 @@ class MainWindow(QMainWindow):
             self.output_dir.setText(directory)
 
     def refresh_devices(self) -> None:
-        try:
-            adb = AdbClient(self.adb_path.text().strip() or "adb")
-            adb.ensure_available()
-            self.devices = adb.devices()
-        except AdbError as exc:
-            self.show_error(str(exc))
-            return
+        self.set_busy(True, "正在刷新设备...")
+        worker = DeviceLoadWorker(self.adb_path.text().strip() or "adb")
+        self.start_worker(worker, worker.run)
+        worker.log.connect(self.log)
+        worker.finished.connect(self.on_devices_loaded)
+        worker.failed.connect(self.on_worker_failed)
 
+    def on_devices_loaded(self, devices: list[Device]) -> None:
+        self.devices = devices
         self.device_combo.clear()
         for device in self.devices:
             self.device_combo.addItem(device.display_name, device.serial)
-        self.log(f"找到 {len(self.devices)} 台设备。")
+        self.set_busy(False, f"找到 {len(self.devices)} 台设备。")
 
     def load_apps(self) -> None:
         serial = self.current_serial()
@@ -245,12 +326,18 @@ class MainWindow(QMainWindow):
         self.start_worker(worker, worker.run)
         worker.log.connect(self.log)
         worker.finished.connect(self.on_apps_loaded)
+        worker.cancelled.connect(self.on_apps_load_cancelled)
         worker.failed.connect(self.on_worker_failed)
 
     def on_apps_loaded(self, apps: list[AppInfo]) -> None:
         self.apps = apps
         self.populate_table()
         self.set_busy(False, f"已加载 {len(apps)} 个应用。")
+
+    def on_apps_load_cancelled(self, apps: list[AppInfo]) -> None:
+        self.apps = apps
+        self.populate_table()
+        self.set_busy(False, f"应用加载已中断，已加载 {len(apps)} 个应用。")
 
     def populate_table(self) -> None:
         self.table.setRowCount(0)
@@ -266,6 +353,44 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 2, QTableWidgetItem(app.package or ""))
             self.table.setItem(row, 3, QTableWidgetItem(app.display_version or ""))
             self.table.setItem(row, 4, QTableWidgetItem(str(len(app.apk_paths or []))))
+        self.apply_filter(self.search_box.text())
+
+    def load_selected_metadata(self) -> None:
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+        row = selected_rows[0].row()
+        if row < 0 or row >= len(self.apps):
+            return
+        app = self.apps[row]
+        serial = self.current_serial()
+        if not serial or app.metadata_loaded:
+            return
+        if self.metadata_thread and self.metadata_thread.isRunning():
+            return
+
+        self.status_label.setText(f"正在读取 {app.package} 的应用信息...")
+        worker = AppMetadataWorker(self.adb_path.text().strip() or "adb", serial, row, app)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.on_metadata_loaded)
+        worker.failed.connect(self.log)
+        worker.finished.connect(lambda *_args: thread.quit())
+        worker.failed.connect(lambda *_args: thread.quit())
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.metadata_thread = thread
+        thread.start()
+
+    def on_metadata_loaded(self, row: int, app: AppInfo) -> None:
+        if row < 0 or row >= len(self.apps) or self.apps[row].package != app.package:
+            return
+        self.apps[row] = app
+        self.table.item(row, 1).setText(app.name or "")
+        self.table.item(row, 3).setText(app.display_version or "")
+        self.table.item(row, 4).setText(str(len(app.apk_paths or [])))
+        self.status_label.setText(f"已读取 {app.package} 的应用信息。")
         self.apply_filter(self.search_box.text())
 
     def apply_filter(self, text: str) -> None:
@@ -309,6 +434,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_backup_finished)
+        worker.cancelled.connect(self.on_backup_cancelled)
         worker.failed.connect(self.on_worker_failed)
 
     def start_restore(self) -> None:
@@ -330,6 +456,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_restore_finished)
+        worker.cancelled.connect(self.on_restore_cancelled)
         worker.failed.connect(self.on_worker_failed)
 
     def start_worker(self, worker: QObject, run_slot) -> None:
@@ -341,16 +468,29 @@ class MainWindow(QMainWindow):
         thread.started.connect(run_slot)
         thread.finished.connect(thread.deleteLater)
         self.worker_thread = thread
+        self.active_worker = worker
+        self.cancel_button.setEnabled(hasattr(worker, "request_cancel"))
 
         def cleanup() -> None:
             thread.quit()
             worker.deleteLater()
+            self.active_worker = None
 
         if hasattr(worker, "finished"):
             worker.finished.connect(lambda *_args: cleanup())
         if hasattr(worker, "failed"):
             worker.failed.connect(lambda *_args: cleanup())
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda *_args: cleanup())
         thread.start()
+
+    def cancel_current_operation(self) -> None:
+        worker = self.active_worker
+        if worker and hasattr(worker, "request_cancel"):
+            worker.request_cancel()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("正在中断...")
+            self.log("正在中断...")
 
     def on_progress(self, current: int, total: int, message: str) -> None:
         percent = int((current / total) * 100) if total else 0
@@ -361,9 +501,21 @@ class MainWindow(QMainWindow):
         self.set_busy(False, f"备份完成：{zip_path}")
         QMessageBox.information(self, "备份完成", f"已创建备份归档：\n{zip_path}")
 
+    def on_backup_cancelled(self, completed_apps: list[str], archive_path: str) -> None:
+        completed_text = "\n".join(completed_apps) if completed_apps else "无"
+        archive_text = f"\n\n已保存部分归档：\n{archive_path}" if archive_path else ""
+        self.set_busy(False, f"备份已中断，已完成 {len(completed_apps)} 个应用。")
+        self.log(f"已完成应用：{', '.join(completed_apps) if completed_apps else '无'}")
+        QMessageBox.information(self, "备份已中断", f"已完成应用：\n{completed_text}{archive_text}")
+
     def on_restore_finished(self) -> None:
         self.set_busy(False, "恢复完成。")
         QMessageBox.information(self, "恢复完成", "恢复操作已完成。")
+
+    def on_restore_cancelled(self, completed_apps: list[str]) -> None:
+        completed_text = "\n".join(completed_apps) if completed_apps else "无"
+        self.set_busy(False, f"恢复已中断，已完成 {len(completed_apps)} 个应用。")
+        QMessageBox.information(self, "恢复已中断", f"已完成应用：\n{completed_text}")
 
     def on_worker_failed(self, message: str) -> None:
         self.set_busy(False, "操作失败。")
@@ -382,6 +534,8 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not busy)
         if busy:
             self.progress.setValue(0)
+        self.cancel_button.setVisible(busy)
+        self.cancel_button.setEnabled(busy and self.active_worker is not None and hasattr(self.active_worker, "request_cancel"))
         self.status_label.setText(status)
         self.log(status)
 

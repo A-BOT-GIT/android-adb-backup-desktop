@@ -25,6 +25,7 @@ class AppInfo:
     version_code: str = ""
     apk_paths: list[str] = field(default_factory=list)
     is_system: bool = False
+    metadata_loaded: bool = False
 
     @property
     def display_version(self) -> str:
