@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import shutil
 import stat
+import tarfile
 import tempfile
 import threading
 import time
@@ -158,8 +160,10 @@ class BackupService:
                         {
                             "package": app.package or "",
                             "name": app.name or "",
+                            "localized_name": app.localized_name or "",
                             "version_name": app.version_name or "",
                             "version_code": app.version_code or "",
+                            "package_size_bytes": app.package_size_bytes,
                             "apk_files": apk_files,
                             "data_files": data_files,
                             "obb_files": obb_files,
@@ -260,12 +264,20 @@ class BackupService:
                         self._check_cancel()
                         relative_parent = child.relative_to(obb_dir).parent.as_posix()
                         remote_parent = remote_obb if relative_parent == "." else f"{remote_obb}/{relative_parent}"
-                        self.adb.shell("mkdir", "-p", remote_parent, timeout=30, check=False)
+                        self.adb.shell("mkdir", "-p", shlex.quote(remote_parent), timeout=30, check=False)
                         self.adb.push(child, remote_parent, timeout=None)
                     obb_size = sum(path.stat().st_size for path in obb_files)
                     self._log(log, f"已恢复 {package} 的 OBB 文件：文件={len(obb_files)} 大小={obb_size}B")
 
                 if restore_data:
+                    run_as_tar = app_dir / "data" / "run-as-data.tar"
+                    if run_as_tar.exists():
+                        self._check_cancel()
+                        self._validate_run_as_tar(run_as_tar)
+                        size = run_as_tar.stat().st_size
+                        self._log(log, f"正在通过 run-as 恢复 {package} 的数据 大小={size}B")
+                        self.adb.restore_run_as_data(package, run_as_tar)
+
                     for ab_file in sorted((app_dir / "data").glob("*.ab")):
                         self._check_cancel()
                         size = ab_file.stat().st_size
@@ -417,6 +429,24 @@ class BackupService:
         mode = (info.external_attr >> 16) & 0o170000
         if mode == stat.S_IFLNK:
             raise ValueError(f"备份归档包含不支持的符号链接：{name}")
+
+    @staticmethod
+    def _validate_run_as_tar(path: Path) -> None:
+        try:
+            with tarfile.open(path, "r:*") as archive:
+                for member in archive.getmembers():
+                    name = member.name
+                    parts = PurePosixPath(name).parts
+                    if not name or name.startswith("/") or "\\" in name or ":" in name:
+                        raise ValueError(f"run-as 数据归档包含不安全路径：{name}")
+                    if any(part in {"", ".."} for part in parts):
+                        raise ValueError(f"run-as 数据归档包含不安全路径：{name}")
+                    if member.issym() or member.islnk():
+                        raise ValueError(f"run-as 数据归档包含不支持的链接：{name}")
+                    if not (member.isfile() or member.isdir()):
+                        raise ValueError(f"run-as 数据归档包含不支持的条目：{name}")
+        except tarfile.TarError as exc:
+            raise ValueError(f"run-as 数据归档无效：{path.name}") from exc
 
     @staticmethod
     def _directory_size(path: Path) -> int:

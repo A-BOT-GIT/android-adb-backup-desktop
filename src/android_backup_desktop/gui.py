@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
         self.browse_output_button = QPushButton("浏览")
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("按包名、应用名称或版本筛选")
+        self.search_box.setPlaceholderText("按包名、应用名称、版本或大小筛选")
         self.refresh_apps_button = QPushButton("加载应用")
         self.select_all_button = QPushButton("全选")
         self.clear_button = QPushButton("清除")
@@ -217,8 +217,8 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setVisible(False)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["备份", "应用", "包名", "版本", "APK 数量"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["备份", "应用", "包名", "版本", "APK 数量", "大小"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -304,10 +304,12 @@ class MainWindow(QMainWindow):
     def refresh_devices(self) -> None:
         self.set_busy(True, "正在刷新设备...")
         worker = DeviceLoadWorker(self.adb_path.text().strip() or "adb")
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.finished.connect(self.on_devices_loaded)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def on_devices_loaded(self, devices: list[Device]) -> None:
         self.devices = devices
@@ -323,11 +325,13 @@ class MainWindow(QMainWindow):
             return
         self.set_busy(True, "正在加载应用...")
         worker = AppLoadWorker(self.adb_path.text().strip() or "adb", serial, self.include_system.isChecked())
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.finished.connect(self.on_apps_loaded)
         worker.cancelled.connect(self.on_apps_load_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def on_apps_loaded(self, apps: list[AppInfo]) -> None:
         self.apps = apps
@@ -349,10 +353,11 @@ class MainWindow(QMainWindow):
             checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             checkbox_item.setCheckState(Qt.CheckState.Unchecked)
             self.table.setItem(row, 0, checkbox_item)
-            self.table.setItem(row, 1, QTableWidgetItem(app.name or ""))
+            self.table.setItem(row, 1, QTableWidgetItem(app.display_name))
             self.table.setItem(row, 2, QTableWidgetItem(app.package or ""))
             self.table.setItem(row, 3, QTableWidgetItem(app.display_version or ""))
             self.table.setItem(row, 4, QTableWidgetItem(str(len(app.apk_paths or []))))
+            self.table.setItem(row, 5, QTableWidgetItem(app.display_package_size))
         self.apply_filter(self.search_box.text())
 
     def load_selected_metadata(self) -> None:
@@ -378,25 +383,40 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self.log)
         worker.finished.connect(lambda *_args: thread.quit())
         worker.failed.connect(lambda *_args: thread.quit())
+        thread.finished.connect(lambda: self._clear_metadata_thread(thread))
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self.metadata_thread = thread
         thread.start()
 
+    def _clear_metadata_thread(self, thread: QThread) -> None:
+        if self.metadata_thread is thread:
+            self.metadata_thread = None
+
     def on_metadata_loaded(self, row: int, app: AppInfo) -> None:
         if row < 0 or row >= len(self.apps) or self.apps[row].package != app.package:
             return
         self.apps[row] = app
-        self.table.item(row, 1).setText(app.name or "")
+        self.table.item(row, 1).setText(app.display_name)
         self.table.item(row, 3).setText(app.display_version or "")
         self.table.item(row, 4).setText(str(len(app.apk_paths or [])))
+        self.table.item(row, 5).setText(app.display_package_size)
         self.status_label.setText(f"已读取 {app.package} 的应用信息。")
         self.apply_filter(self.search_box.text())
 
     def apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
         for row, app in enumerate(self.apps):
-            visible = not needle or needle in " ".join([app.name or "", app.package or "", app.display_version or ""]).lower()
+            visible = not needle or needle in " ".join(
+                [
+                    app.display_name,
+                    app.name or "",
+                    app.localized_name or "",
+                    app.package or "",
+                    app.display_version or "",
+                    app.display_package_size,
+                ]
+            ).lower()
             self.table.setRowHidden(row, not visible)
 
     def set_all_checked(self, checked: bool) -> None:
@@ -430,12 +450,14 @@ class MainWindow(QMainWindow):
         )
         self.set_busy(True, "正在开始备份...")
         worker = BackupWorker(self.adb_path.text().strip() or "adb", serial, apps, options)
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_backup_finished)
         worker.cancelled.connect(self.on_backup_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def start_restore(self) -> None:
         serial = self.current_serial()
@@ -452,29 +474,41 @@ class MainWindow(QMainWindow):
             Path(file_name),
             self.restore_data.isChecked(),
         )
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_restore_finished)
         worker.cancelled.connect(self.on_restore_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
-    def start_worker(self, worker: QObject, run_slot) -> None:
-        if self.worker_thread and self.worker_thread.isRunning():
-            self.show_error("已有另一个操作正在运行。")
-            return
+    def start_worker(self, worker: QObject, run_slot) -> bool:
+        try:
+            if self.worker_thread and self.worker_thread.isRunning():
+                self.show_error("已有另一个操作正在运行。")
+                return False
+        except RuntimeError:
+            self.worker_thread = None
+
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(run_slot)
         thread.finished.connect(thread.deleteLater)
         self.worker_thread = thread
+        self.worker_thread.finished.connect(lambda: setattr(self, "worker_thread", None))
         self.active_worker = worker
         self.cancel_button.setEnabled(hasattr(worker, "request_cancel"))
 
         def cleanup() -> None:
-            thread.quit()
-            worker.deleteLater()
-            self.active_worker = None
+            try:
+                thread.quit()
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+            finally:
+                self.active_worker = None
+                self.worker_thread = None
 
         if hasattr(worker, "finished"):
             worker.finished.connect(lambda *_args: cleanup())
@@ -482,7 +516,14 @@ class MainWindow(QMainWindow):
             worker.failed.connect(lambda *_args: cleanup())
         if hasattr(worker, "cancelled"):
             worker.cancelled.connect(lambda *_args: cleanup())
-        thread.start()
+        return True
+
+    def begin_worker(self) -> None:
+        try:
+            if self.worker_thread:
+                self.worker_thread.start()
+        except RuntimeError:
+            self.worker_thread = None
 
     def cancel_current_operation(self) -> None:
         worker = self.active_worker

@@ -15,7 +15,7 @@
 - 导出 base/split APK 文件。
 - 在设备允许时可选导出 OBB 文件和应用数据。
 - 生成包含 `manifest.json` 的可移植 `.zip` 备份归档。
-- 从备份 ZIP 恢复 APK。若归档中包含 OBB 文件，也会恢复 OBB；`.ab` 数据文件会通过 `adb restore` 恢复。
+- 从备份 ZIP 恢复 APK。若归档中包含 OBB 文件，也会恢复 OBB；`run-as-data.tar` 会通过 `run-as` 恢复，`.ab` 数据文件会通过 `adb restore` 恢复。
 
 ## 环境要求
 
@@ -68,4 +68,4 @@ backup.zip
 
 - Android 会限制私有应用数据访问。缺失数据文件或数据文件很小，通常表示应用或系统拒绝了备份。
 - `adb backup` 已废弃，在较新的 Android 版本上并不可靠。本程序保留它作为回退方案，因为部分设备和旧应用仍然支持。
-- `run-as-data.tar` 不会自动恢复，因为 Android 只允许对可调试包使用 `run-as`，且所有权和 SELinux 状态可能不同。当前已实现 APK 和 `.ab` 的恢复路径。
+- `run-as-data.tar` 恢复仍依赖 Android 允许目标包使用 `run-as`；如果目标安装包不可调试，设备会拒绝该数据恢复。
