@@ -1,4 +1,5 @@
 import json
+import shlex
 import stat
 import zipfile
 from pathlib import Path
@@ -95,3 +96,23 @@ def test_restore_pushes_nested_obb_files_to_matching_remote_parents(tmp_path: Pa
         "/sdcard/Android/obb/com.example.game",
         "/sdcard/Android/obb/com.example.game/patches/level1",
     }
+
+
+def test_restore_quotes_archive_derived_obb_parent_for_shell_mkdir(tmp_path: Path) -> None:
+    zip_path = tmp_path / "backup.zip"
+    manifest = {"apps": [{"package": "com.example.game"}]}
+    write_backup(
+        zip_path,
+        manifest,
+        {
+            "apps/com.example.game/obb/levels;echo injected/patch.obb": b"patch",
+        },
+    )
+    adb = FakeAdb()
+
+    BackupService(adb).restore_backup(zip_path, restore_data=False)
+
+    remote_parent = "/sdcard/Android/obb/com.example.game/levels;echo injected"
+    assert ("mkdir", "-p", shlex.quote(remote_parent)) in adb.shell_calls
+    assert ("mkdir", "-p", remote_parent) not in adb.shell_calls
+    assert [remote for _, remote in adb.push_calls] == [remote_parent]

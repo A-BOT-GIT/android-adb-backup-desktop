@@ -304,10 +304,12 @@ class MainWindow(QMainWindow):
     def refresh_devices(self) -> None:
         self.set_busy(True, "正在刷新设备...")
         worker = DeviceLoadWorker(self.adb_path.text().strip() or "adb")
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.finished.connect(self.on_devices_loaded)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def on_devices_loaded(self, devices: list[Device]) -> None:
         self.devices = devices
@@ -323,11 +325,13 @@ class MainWindow(QMainWindow):
             return
         self.set_busy(True, "正在加载应用...")
         worker = AppLoadWorker(self.adb_path.text().strip() or "adb", serial, self.include_system.isChecked())
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.finished.connect(self.on_apps_loaded)
         worker.cancelled.connect(self.on_apps_load_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def on_apps_loaded(self, apps: list[AppInfo]) -> None:
         self.apps = apps
@@ -378,10 +382,15 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self.log)
         worker.finished.connect(lambda *_args: thread.quit())
         worker.failed.connect(lambda *_args: thread.quit())
+        thread.finished.connect(lambda: self._clear_metadata_thread(thread))
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self.metadata_thread = thread
         thread.start()
+
+    def _clear_metadata_thread(self, thread: QThread) -> None:
+        if self.metadata_thread is thread:
+            self.metadata_thread = None
 
     def on_metadata_loaded(self, row: int, app: AppInfo) -> None:
         if row < 0 or row >= len(self.apps) or self.apps[row].package != app.package:
@@ -430,12 +439,14 @@ class MainWindow(QMainWindow):
         )
         self.set_busy(True, "正在开始备份...")
         worker = BackupWorker(self.adb_path.text().strip() or "adb", serial, apps, options)
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_backup_finished)
         worker.cancelled.connect(self.on_backup_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
     def start_restore(self) -> None:
         serial = self.current_serial()
@@ -452,17 +463,23 @@ class MainWindow(QMainWindow):
             Path(file_name),
             self.restore_data.isChecked(),
         )
-        self.start_worker(worker, worker.run)
+        if not self.start_worker(worker, worker.run):
+            return
         worker.log.connect(self.log)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_restore_finished)
         worker.cancelled.connect(self.on_restore_cancelled)
         worker.failed.connect(self.on_worker_failed)
+        self.begin_worker()
 
-    def start_worker(self, worker: QObject, run_slot) -> None:
-        if self.worker_thread and self.worker_thread.isRunning():
-            self.show_error("已有另一个操作正在运行。")
-            return
+    def start_worker(self, worker: QObject, run_slot) -> bool:
+        try:
+            if self.worker_thread and self.worker_thread.isRunning():
+                self.show_error("已有另一个操作正在运行。")
+                return False
+        except RuntimeError:
+            self.worker_thread = None
+
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(run_slot)
@@ -472,9 +489,14 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(hasattr(worker, "request_cancel"))
 
         def cleanup() -> None:
-            thread.quit()
-            worker.deleteLater()
-            self.active_worker = None
+            try:
+                thread.quit()
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+            finally:
+                self.active_worker = None
+                self.worker_thread = None
 
         if hasattr(worker, "finished"):
             worker.finished.connect(lambda *_args: cleanup())
@@ -482,7 +504,11 @@ class MainWindow(QMainWindow):
             worker.failed.connect(lambda *_args: cleanup())
         if hasattr(worker, "cancelled"):
             worker.cancelled.connect(lambda *_args: cleanup())
-        thread.start()
+        return True
+
+    def begin_worker(self) -> None:
+        if self.worker_thread:
+            self.worker_thread.start()
 
     def cancel_current_operation(self) -> None:
         worker = self.active_worker

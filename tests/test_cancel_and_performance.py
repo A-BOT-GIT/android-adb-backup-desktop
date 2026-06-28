@@ -1,13 +1,14 @@
 import json
 import os
+import subprocess
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from android_backup_desktop.adb import AdbClient
+from android_backup_desktop.adb import LONG_ADB_OPERATION_TIMEOUT, AdbClient
 from android_backup_desktop.backup import BackupService, OperationCancelled
-from android_backup_desktop.models import AppInfo, BackupOptions
+from android_backup_desktop.models import AppInfo, BackupOptions, Device
 
 
 class FakeBackupAdb:
@@ -67,6 +68,7 @@ def test_cancelled_backup_keeps_completed_apps_and_removes_tmp(tmp_path: Path) -
 class CountingAdbClient(AdbClient):
     def __init__(self, package_count: int) -> None:
         self.package_count = package_count
+        self.serial = None
         self.run_calls: list[list[str]] = []
         self.shell_calls: list[tuple[str, ...]] = []
 
@@ -115,9 +117,10 @@ def test_device_refresh_is_dispatched_to_background_worker(monkeypatch: pytest.M
     app = QApplication.instance() or QApplication([])
     captured: dict[str, object] = {}
 
-    def fake_start_worker(self: MainWindow, worker, run_slot) -> None:
+    def fake_start_worker(self: MainWindow, worker, run_slot) -> bool:
         captured["worker"] = worker
         captured["run_slot"] = run_slot
+        return True
 
     monkeypatch.setattr(MainWindow, "start_worker", fake_start_worker)
     window = MainWindow()
@@ -126,3 +129,88 @@ def test_device_refresh_is_dispatched_to_background_worker(monkeypatch: pytest.M
     assert isinstance(captured["worker"], DeviceLoadWorker)
     assert captured["run_slot"] == captured["worker"].run
     window.close()
+
+
+def test_fast_device_worker_result_is_handled_after_worker_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    import android_backup_desktop.gui as gui_module
+    from android_backup_desktop.gui import MainWindow
+
+    class FakeAdbClient:
+        def __init__(self, adb_path: str) -> None:
+            self.adb_path = adb_path
+
+        def ensure_available(self) -> None:
+            pass
+
+        def devices(self) -> list[Device]:
+            return [Device(serial="serial-1", state="device", description="")]
+
+    captured: dict[str, object] = {}
+
+    def fake_start_worker(self: MainWindow, worker, run_slot) -> bool:
+        captured["worker"] = worker
+        captured["run_slot"] = run_slot
+        return True
+
+    def fake_begin_worker(self: MainWindow) -> None:
+        captured["began"] = True
+        captured["run_slot"]()
+
+    monkeypatch.setattr(gui_module, "AdbClient", FakeAdbClient)
+    monkeypatch.setattr(MainWindow, "start_worker", fake_start_worker)
+    monkeypatch.setattr(MainWindow, "begin_worker", fake_begin_worker)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    app.processEvents()
+
+    assert captured["began"] is True
+    assert window.device_combo.count() == 1
+    assert window.current_serial() == "serial-1"
+    assert "找到 1 台设备" in window.status_label.text()
+    window.close()
+
+
+def test_metadata_thread_reference_is_cleared_before_thread_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QThread
+    from PySide6.QtWidgets import QApplication
+
+    from android_backup_desktop.gui import MainWindow
+
+    monkeypatch.setattr(MainWindow, "start_worker", lambda *_args: False)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    thread = QThread(window)
+
+    window.metadata_thread = thread
+    window._clear_metadata_thread(thread)
+
+    assert window.metadata_thread is None
+    thread.deleteLater()
+    window.close()
+
+
+def test_long_adb_operations_use_bounded_timeouts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: list[tuple[list[str], int | None]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append((list(command), kwargs.get("timeout")))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    client = AdbClient.__new__(AdbClient)
+    client.adb_path = "adb"
+    client.serial = None
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    client.pull("/sdcard/file.bin", tmp_path / "file.bin")
+    client.push(tmp_path / "file.bin", "/sdcard/file.bin")
+    client.install([tmp_path / "app.apk"])
+    client.adb_restore(tmp_path / "backup.ab")
+
+    assert [timeout for _, timeout in captured] == [LONG_ADB_OPERATION_TIMEOUT] * 4

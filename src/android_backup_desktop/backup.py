@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import shutil
 import stat
 import tempfile
@@ -260,7 +261,7 @@ class BackupService:
                         self._check_cancel()
                         relative_parent = child.relative_to(obb_dir).parent.as_posix()
                         remote_parent = remote_obb if relative_parent == "." else f"{remote_obb}/{relative_parent}"
-                        self.adb.shell("mkdir", "-p", remote_parent, timeout=30, check=False)
+                        self.adb.shell("mkdir", "-p", shlex.quote(remote_parent), timeout=30, check=False)
                         self.adb.push(child, remote_parent, timeout=None)
                     obb_size = sum(path.stat().st_size for path in obb_files)
                     self._log(log, f"已恢复 {package} 的 OBB 文件：文件={len(obb_files)} 大小={obb_size}B")

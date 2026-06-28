@@ -25,6 +25,7 @@ class AdbError(RuntimeError):
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 DEFAULT_ADB_NAMES = {"adb", "adb.exe"}
+LONG_ADB_OPERATION_TIMEOUT = 30 * 60
 
 
 def _is_default_adb_path(adb_path: str) -> bool:
@@ -347,20 +348,28 @@ class AdbClient:
     def apk_paths(self, package: str) -> list[str]:
         return parse_pm_path_lines(self.shell("pm", "path", package, timeout=20, check=False))
 
+    @staticmethod
+    def _long_timeout(timeout: int | None) -> int:
+        # Cancellation is cooperative at the BackupService layer, so an in-flight
+        # adb subprocess cannot be interrupted without a larger process-manager
+        # redesign. Keep these high-risk operations bounded instead of allowing
+        # indefinite hangs when cancellation is requested during the subprocess.
+        return LONG_ADB_OPERATION_TIMEOUT if timeout is None else timeout
+
     def pull(self, remote: str, local: Path, timeout: int | None = None) -> None:
         local.parent.mkdir(parents=True, exist_ok=True)
-        self._run(["pull", remote, str(local)], timeout=timeout)
+        self._run(["pull", remote, str(local)], timeout=self._long_timeout(timeout))
 
     def push(self, local: Path, remote: str, timeout: int | None = None) -> None:
-        self._run(["push", str(local), remote], timeout=timeout)
+        self._run(["push", str(local), remote], timeout=self._long_timeout(timeout))
 
     def install(self, apk_files: list[Path]) -> None:
         if not apk_files:
             raise AdbError("没有可安装的 APK 文件。")
         if len(apk_files) == 1:
-            self._run(["install", "-r", str(apk_files[0])], timeout=None)
+            self._run(["install", "-r", str(apk_files[0])], timeout=LONG_ADB_OPERATION_TIMEOUT)
             return
-        self._run(["install-multiple", "-r", *[str(path) for path in apk_files]], timeout=None)
+        self._run(["install-multiple", "-r", *[str(path) for path in apk_files]], timeout=LONG_ADB_OPERATION_TIMEOUT)
 
     def adb_backup_package(self, package: str, output_file: Path, *, include_apk: bool = False) -> None:
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -368,7 +377,7 @@ class AdbClient:
         self._run(["backup", "-f", str(output_file), apk_flag, package], timeout=180)
 
     def adb_restore(self, backup_file: Path) -> None:
-        self._run(["restore", str(backup_file)], timeout=None)
+        self._run(["restore", str(backup_file)], timeout=LONG_ADB_OPERATION_TIMEOUT)
 
     def export_run_as_data(self, package: str, output_tar: Path) -> bool:
         output_tar.parent.mkdir(parents=True, exist_ok=True)
