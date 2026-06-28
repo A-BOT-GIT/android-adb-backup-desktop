@@ -190,8 +190,9 @@ class AdbClient:
         command = self._base_args() + args
         command_text = " ".join(str(part) for part in command)
         start = time.perf_counter()
-        logger.info("ADB begin: %s timeout=%s", command_text, timeout)
+        logger.info("ADB begin: %s timeout=%s serial=%s", command_text, timeout, self.serial)
         try:
+            logger.debug("Calling subprocess.run with command: %s", command)
             completed = subprocess.run(
                 command,
                 capture_output=True,
@@ -199,6 +200,7 @@ class AdbClient:
                 timeout=timeout,
                 creationflags=CREATE_NO_WINDOW,
             )
+            logger.debug("subprocess.run returned successfully")
         except FileNotFoundError as exc:
             logger.exception("ADB failed: %s", command_text)
             raise AdbError(f"未找到 ADB：{self.adb_path}") from exc
@@ -210,14 +212,18 @@ class AdbClient:
         elapsed = time.perf_counter() - start
         stdout = completed.stdout if isinstance(completed.stdout, str) else completed.stdout.decode(errors="replace")
         stderr = completed.stderr if isinstance(completed.stderr, str) else completed.stderr.decode(errors="replace")
+        stdout_len = len(stdout) if stdout else 0
+        stderr_len = len(stderr) if stderr else 0
         logger.info(
-            "ADB end: %s returncode=%s elapsed=%.2fs stdout=%r stderr=%r",
+            "ADB end: %s returncode=%s elapsed=%.2fs stdout_len=%d stderr_len=%d",
             command_text,
             completed.returncode,
             elapsed,
-            stdout,
-            stderr,
+            stdout_len,
+            stderr_len,
         )
+        if stdout_len > 100000:
+            logger.warning("Large stdout output detected: %d bytes for command: %s", stdout_len, command_text)
         if check and completed.returncode != 0:
             message = (stderr or stdout or "未知 ADB 错误").strip()
             raise AdbError(message)
@@ -246,22 +252,48 @@ class AdbClient:
         progress: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[AppInfo]:
-        package_args = ["shell", "pm", "list", "packages", "-f"]
-        if not include_system:
-            package_args.append("-3")
-        package_map = parse_package_lines(self._run(package_args, timeout=60).stdout)
-        third_party_packages = set(package_map)
-        if include_system:
-            if progress:
-                progress("正在读取第三方应用集合...")
-            third_party_packages = self.third_party_packages()
-        apps: list[AppInfo] = []
+        logger.info("list_apps starting: include_system=%s serial=%s", include_system, self.serial)
+        if progress:
+            progress("正在获取应用列表...")
 
+        if include_system:
+            logger.debug("list_apps: include_system=True, fetching all packages first")
+            start = time.perf_counter()
+            if progress:
+                progress("正在获取所有应用...")
+            logger.info("list_apps: calling pm list packages -f (all packages)")
+            package_map = parse_package_lines(self._run(["shell", "pm", "list", "packages", "-f"], timeout=120).stdout)
+            elapsed = time.perf_counter() - start
+            logger.info("list_apps: retrieved all packages: count=%d elapsed=%.2fs", len(package_map), elapsed)
+
+            logger.debug("list_apps: now fetching third-party packages only")
+            start = time.perf_counter()
+            if progress:
+                progress("正在获取第三方应用集合...")
+            logger.info("list_apps: calling pm list packages -3 (third-party packages)")
+            third_party_output = self.shell("pm", "list", "packages", "-3", timeout=120, check=False)
+            third_party_packages = set(parse_package_lines(third_party_output))
+            elapsed = time.perf_counter() - start
+            logger.info("list_apps: retrieved third-party packages: count=%d elapsed=%.2fs", len(third_party_packages), elapsed)
+        else:
+            logger.debug("list_apps: include_system=False, fetching third-party packages with paths")
+            start = time.perf_counter()
+            logger.info("list_apps: calling pm list packages -3 -f (third-party packages only)")
+            package_map = parse_package_lines(self._run(["shell", "pm", "list", "packages", "-3", "-f"], timeout=120).stdout)
+            elapsed = time.perf_counter() - start
+            logger.info("list_apps: retrieved third-party packages only: count=%d elapsed=%.2fs", len(package_map), elapsed)
+            third_party_packages = set(package_map)
+
+        logger.info("list_apps: building AppInfo objects from %d packages", len(package_map))
+        apps: list[AppInfo] = []
         for index, (package, apk_paths) in enumerate(sorted(package_map.items()), start=1):
             if should_cancel and should_cancel():
+                logger.info("list_apps: cancelled at index %d/%d", index, len(package_map))
                 break
             if progress:
                 progress(f"正在读取应用列表 {index}/{len(package_map)}：{package}")
+            if index % 10 == 0 or index == 1:
+                logger.debug("list_apps: processing index %d/%d package=%s", index, len(package_map), package)
 
             apps.append(
                 AppInfo(
@@ -274,11 +306,16 @@ class AdbClient:
                     metadata_loaded=False,
                 )
             )
+        logger.info("list_apps completed: total_apps=%d include_system=%s", len(apps), include_system)
         return apps
 
     def third_party_packages(self) -> set[str]:
-        output = self.shell("pm", "list", "packages", "-3", timeout=60, check=False)
-        return set(parse_package_lines(output))
+        start = time.perf_counter()
+        output = self.shell("pm", "list", "packages", "-3", timeout=120, check=False)
+        packages = set(parse_package_lines(output))
+        elapsed = time.perf_counter() - start
+        logger.info("Retrieved third-party packages: count=%d elapsed=%.2fs", len(packages), elapsed)
+        return packages
 
     def load_app_metadata(self, app: AppInfo) -> AppInfo:
         apk_paths = app.apk_paths or self.apk_paths(app.package)
