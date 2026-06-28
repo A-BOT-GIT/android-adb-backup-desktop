@@ -160,8 +160,10 @@ class BackupService:
                         {
                             "package": app.package or "",
                             "name": app.name or "",
+                            "localized_name": app.localized_name or "",
                             "version_name": app.version_name or "",
                             "version_code": app.version_code or "",
+                            "package_size_bytes": app.package_size_bytes,
                             "apk_files": apk_files,
                             "data_files": data_files,
                             "obb_files": obb_files,

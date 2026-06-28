@@ -28,9 +28,11 @@ class FakeBackupAdb:
         return AppInfo(
             package=app.package,
             name=app.name or app.package,
+            localized_name=app.localized_name,
             version_name=app.version_name or "",
             version_code=app.version_code or "",
             apk_paths=app.apk_paths,
+            package_size_bytes=app.package_size_bytes,
             is_system=app.is_system,
             metadata_loaded=True,
         )
@@ -105,6 +107,74 @@ def test_list_apps_uses_bulk_package_queries_for_100_plus_apps() -> None:
     assert apps[0].metadata_loaded is False
     assert apps[0].is_system is False
     assert apps[1].is_system is True
+
+
+def test_load_app_metadata_adds_package_size_from_apk_paths() -> None:
+    class SizeAdbClient(AdbClient):
+        def __init__(self) -> None:
+            self.serial = None
+            self.shell_calls: list[tuple[str, ...]] = []
+
+        def shell(self, *args: str, timeout: int | None = 60, check: bool = True) -> str:
+            self.shell_calls.append(args)
+            if args[:2] == ("dumpsys", "package"):
+                return "versionName=1.0 versionCode=2 minSdk=23"
+            if args[:3] == ("stat", "-c", "%s"):
+                if args[3].endswith("/base.apk"):
+                    return "1024\n"
+                if args[3].endswith("/split.apk"):
+                    return "2048\n"
+                return ""
+            raise AssertionError(f"unexpected shell call: {args}")
+
+        def _read_label_from_apk(self, package: str, apk_paths: list[str]) -> tuple[str, str, str, str]:
+            return "", "", "", ""
+
+    adb = SizeAdbClient()
+
+    app = adb.load_app_metadata(
+        AppInfo(
+            package="com.example",
+            name="com.example",
+            apk_paths=["/data/app/com.example/base.apk", "/data/app/com.example/split.apk"],
+        )
+    )
+
+    assert app.package_size_bytes == 3072
+    assert app.display_package_size == "3.0 KB"
+    assert app.display_name == "com.example"
+
+
+def test_load_app_metadata_uses_localized_name_when_apk_reader_provides_it() -> None:
+    class LocalizedNameAdbClient(AdbClient):
+        def __init__(self) -> None:
+            self.serial = None
+
+        def shell(self, *args: str, timeout: int | None = 60, check: bool = True) -> str:
+            if args[:2] == ("dumpsys", "package"):
+                return ""
+            if args[:3] == ("stat", "-c", "%s"):
+                return ""
+            if args[0] == "wc":
+                return ""
+            raise AssertionError(f"unexpected shell call: {args}")
+
+        def _read_label_from_apk(self, package: str, apk_paths: list[str]) -> tuple[str, str, str, str]:
+            return "Example", "示例应用", "1.0", "2"
+
+    adb = LocalizedNameAdbClient()
+
+    app = adb.load_app_metadata(
+        AppInfo(
+            package="com.example",
+            name="com.example",
+            apk_paths=["/data/app/com.example/base.apk"],
+        )
+    )
+
+    assert app.name == "Example"
+    assert app.localized_name == "示例应用"
+    assert app.display_name == "示例应用"
 
 
 def test_device_refresh_is_dispatched_to_background_worker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,6 +263,38 @@ def test_metadata_thread_reference_is_cleared_before_thread_deletion(monkeypatch
 
     assert window.metadata_thread is None
     thread.deleteLater()
+    window.close()
+
+
+def test_app_table_displays_localized_name_and_package_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from android_backup_desktop.gui import MainWindow
+
+    monkeypatch.setattr(MainWindow, "refresh_devices", lambda _self: None)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.apps = [
+        AppInfo(
+            package="com.example",
+            name="Example",
+            localized_name="示例应用",
+            version_name="1.0",
+            version_code="2",
+            apk_paths=["/data/app/com.example/base.apk"],
+            package_size_bytes=1_572_864,
+            metadata_loaded=True,
+        )
+    ]
+
+    window.populate_table()
+
+    assert window.table.columnCount() == 6
+    assert window.table.horizontalHeaderItem(5).text() == "大小"
+    assert window.table.item(0, 1).text() == "示例应用"
+    assert window.table.item(0, 5).text() == "1.5 MB"
     window.close()
 
 

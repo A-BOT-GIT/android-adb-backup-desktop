@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import inspect
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -152,21 +154,60 @@ def parse_dumpsys_package(output: str) -> tuple[str, str]:
     return version_name, version_code
 
 
-def _apk_label_and_version(apk_path: Path) -> tuple[str, str, str]:
+def _localized_apk_label(apk, fallback_label: str) -> str:
+    get_app_name = getattr(apk, "get_app_name", None)
+    if not callable(get_app_name):
+        return ""
+
+    locale_codes = ("zh-CN", "zh_CN", "zh")
+    for locale_code in locale_codes:
+        for kwargs in ({"locale": locale_code}, {"language": locale_code}, {"lang": locale_code}):
+            try:
+                label = get_app_name(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if label and str(label) != fallback_label:
+                return str(label)
+
+        try:
+            signature = inspect.signature(get_app_name)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is None or any(
+            parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+            for parameter in signature.parameters.values()
+        ):
+            try:
+                label = get_app_name(locale_code)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if label and str(label) != fallback_label:
+                return str(label)
+
+    return ""
+
+
+def _apk_label_and_version(apk_path: Path) -> tuple[str, str, str, str]:
     try:
         from apkutils2 import APK  # type: ignore
     except Exception:
-        return "", "", ""
+        return "", "", "", ""
 
     try:
         apk = APK(str(apk_path))
         manifest = apk.get_manifest()
         label = apk.get_app_name() or ""
+        localized_label = _localized_apk_label(apk, str(label))
         version_name = manifest.get("@android:versionName", "") or ""
         version_code = manifest.get("@android:versionCode", "") or ""
-        return str(label), str(version_name), str(version_code)
+        return str(label), localized_label, str(version_name), str(version_code)
     except Exception:
-        return "", "", ""
+        return "", "", "", ""
 
 
 class AdbClient:
@@ -322,10 +363,14 @@ class AdbClient:
         apk_paths = app.apk_paths or self.apk_paths(app.package)
         version_name, version_code = self.package_version(app.package)
         name = app.name or app.package
+        localized_name = app.localized_name or ""
+        package_size_bytes = self.package_size(apk_paths)
 
-        label, apk_version_name, apk_version_code = self._read_label_from_apk(app.package, apk_paths)
+        label, apk_localized_label, apk_version_name, apk_version_code = self._read_label_from_apk(app.package, apk_paths)
         if label:
             name = label
+        if apk_localized_label:
+            localized_name = apk_localized_label
         if apk_version_name:
             version_name = apk_version_name
         if apk_version_code:
@@ -334,9 +379,11 @@ class AdbClient:
         return AppInfo(
             package=app.package,
             name=name,
+            localized_name=localized_name,
             version_name=version_name,
             version_code=version_code,
             apk_paths=apk_paths,
+            package_size_bytes=package_size_bytes,
             is_system=app.is_system,
             metadata_loaded=True,
         )
@@ -347,6 +394,24 @@ class AdbClient:
 
     def apk_paths(self, package: str) -> list[str]:
         return parse_pm_path_lines(self.shell("pm", "path", package, timeout=20, check=False))
+
+    def package_size(self, apk_paths: list[str]) -> int | None:
+        sizes = [size for path in apk_paths if (size := self.remote_file_size(path)) is not None]
+        if not sizes:
+            return None
+        return sum(sizes)
+
+    def remote_file_size(self, remote_path: str) -> int | None:
+        output = self.shell("stat", "-c", "%s", shlex.quote(remote_path), timeout=15, check=False)
+        match = re.search(r"\b(\d+)\b", output)
+        if match:
+            return int(match.group(1))
+
+        output = self.shell("wc", "-c", shlex.quote(remote_path), timeout=15, check=False)
+        match = re.search(r"\b(\d+)\b", output)
+        if match:
+            return int(match.group(1))
+        return None
 
     @staticmethod
     def _long_timeout(timeout: int | None) -> int:
@@ -476,15 +541,15 @@ class AdbClient:
         result = self.shell("test", "-e", remote_path, "&&", "echo", "yes", timeout=15, check=False)
         return "yes" in result
 
-    def _read_label_from_apk(self, package: str, apk_paths: list[str]) -> tuple[str, str, str]:
+    def _read_label_from_apk(self, package: str, apk_paths: list[str]) -> tuple[str, str, str, str]:
         if not apk_paths:
-            return "", "", ""
+            return "", "", "", ""
         with tempfile.TemporaryDirectory(prefix="adb-apk-meta-") as tmp:
             local_apk = Path(tmp) / f"{package}.apk"
             try:
                 self.pull(apk_paths[0], local_apk, timeout=90)
             except AdbError:
-                return "", "", ""
+                return "", "", "", ""
             return _apk_label_and_version(local_apk)
 
     def _is_third_party(self, package: str) -> bool:

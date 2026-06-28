@@ -1,4 +1,4 @@
-from android_backup_desktop.models import AppInfo
+from android_backup_desktop.models import AppInfo, format_size
 
 
 def test_app_info_with_none_values() -> None:
@@ -50,3 +50,33 @@ def test_app_info_display_version_partial_values() -> None:
         version_code="1",
     )
     assert app2.display_version == "1"
+
+
+def test_app_info_display_name_prefers_localized_name() -> None:
+    app = AppInfo(
+        package="com.example",
+        name="Example",
+        localized_name="示例应用",
+    )
+
+    assert app.display_name == "示例应用"
+
+
+def test_app_info_display_name_falls_back_to_existing_name() -> None:
+    app = AppInfo(
+        package="com.example",
+        name="Example",
+    )
+
+    assert app.display_name == "Example"
+
+
+def test_app_info_display_package_size() -> None:
+    app = AppInfo(
+        package="com.example",
+        name="Example",
+        package_size_bytes=1_572_864,
+    )
+
+    assert app.display_package_size == "1.5 MB"
+    assert format_size(512) == "512 B"
