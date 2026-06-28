@@ -1,3 +1,3 @@
-"""Android Backup Desktop."""
+"""安卓备份工具."""
 
 __version__ = "0.1.0"

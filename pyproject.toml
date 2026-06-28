@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "android-backup-desktop"
 version = "0.1.0"
-description = "Windows desktop Android app backup tool powered by ADB"
+description = "Windows桌面安卓应用备份工具（通过ADB）"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
