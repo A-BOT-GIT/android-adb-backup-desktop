@@ -485,6 +485,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(run_slot)
         thread.finished.connect(thread.deleteLater)
         self.worker_thread = thread
+        self.worker_thread.finished.connect(lambda: setattr(self, "worker_thread", None))
         self.active_worker = worker
         self.cancel_button.setEnabled(hasattr(worker, "request_cancel"))
 
@@ -507,8 +508,11 @@ class MainWindow(QMainWindow):
         return True
 
     def begin_worker(self) -> None:
-        if self.worker_thread:
-            self.worker_thread.start()
+        try:
+            if self.worker_thread:
+                self.worker_thread.start()
+        except RuntimeError:
+            self.worker_thread = None
 
     def cancel_current_operation(self) -> None:
         worker = self.active_worker

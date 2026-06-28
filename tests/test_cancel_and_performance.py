@@ -196,6 +196,35 @@ def test_metadata_thread_reference_is_cleared_before_thread_deletion(monkeypatch
     window.close()
 
 
+def test_worker_thread_reference_is_cleared_when_thread_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QObject, Signal
+    from PySide6.QtWidgets import QApplication
+
+    from android_backup_desktop.gui import MainWindow
+
+    class FinishedWorker(QObject):
+        finished = Signal()
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(MainWindow, "refresh_devices", lambda _self: None)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    worker = FinishedWorker()
+
+    assert window.start_worker(worker, worker.run) is True
+    assert window.worker_thread is not None
+
+    window.worker_thread.finished.emit()
+    app.processEvents()
+
+    assert window.worker_thread is None
+    window.close()
+
+
 def test_long_adb_operations_use_bounded_timeouts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: list[tuple[list[str], int | None]] = []
 
