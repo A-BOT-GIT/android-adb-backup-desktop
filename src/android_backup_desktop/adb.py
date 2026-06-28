@@ -7,12 +7,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
+from .logging_utils import configure_file_logging
 from .models import AppInfo, Device
 
 
+configure_file_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -185,6 +188,9 @@ class AdbClient:
         check: bool = True,
     ) -> subprocess.CompletedProcess:
         command = self._base_args() + args
+        command_text = " ".join(str(part) for part in command)
+        start = time.perf_counter()
+        logger.info("ADB begin: %s timeout=%s", command_text, timeout)
         try:
             completed = subprocess.run(
                 command,
@@ -194,13 +200,25 @@ class AdbClient:
                 creationflags=CREATE_NO_WINDOW,
             )
         except FileNotFoundError as exc:
+            logger.exception("ADB failed: %s", command_text)
             raise AdbError(f"未找到 ADB：{self.adb_path}") from exc
         except subprocess.TimeoutExpired as exc:
+            elapsed = time.perf_counter() - start
+            logger.exception("ADB timeout after %.2fs: %s", elapsed, command_text)
             raise AdbError(f"ADB 命令超时：{' '.join(command)}") from exc
 
+        elapsed = time.perf_counter() - start
+        stdout = completed.stdout if isinstance(completed.stdout, str) else completed.stdout.decode(errors="replace")
+        stderr = completed.stderr if isinstance(completed.stderr, str) else completed.stderr.decode(errors="replace")
+        logger.info(
+            "ADB end: %s returncode=%s elapsed=%.2fs stdout=%r stderr=%r",
+            command_text,
+            completed.returncode,
+            elapsed,
+            stdout,
+            stderr,
+        )
         if check and completed.returncode != 0:
-            stderr = completed.stderr if isinstance(completed.stderr, str) else completed.stderr.decode(errors="replace")
-            stdout = completed.stdout if isinstance(completed.stdout, str) else completed.stdout.decode(errors="replace")
             message = (stderr or stdout or "未知 ADB 错误").strip()
             raise AdbError(message)
         return completed
@@ -303,6 +321,9 @@ class AdbClient:
             f"/data/data/{package}",
             ".",
         ]
+        command_text = " ".join(str(part) for part in command)
+        start = time.perf_counter()
+        logger.info("ADB begin: %s timeout=%s stdout=%s", command_text, 120, output_tar)
         try:
             with output_tar.open("wb") as fh:
                 completed = subprocess.run(
@@ -313,9 +334,22 @@ class AdbClient:
                     creationflags=CREATE_NO_WINDOW,
                 )
         except Exception:
+            logger.exception("ADB failed: %s", command_text)
             output_tar.unlink(missing_ok=True)
             return False
-        if completed.returncode != 0 or output_tar.stat().st_size < 1024:
+        elapsed = time.perf_counter() - start
+        stderr = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr)
+        size = output_tar.stat().st_size if output_tar.exists() else 0
+        logger.info(
+            "ADB end: %s returncode=%s elapsed=%.2fs stdout_file=%s stdout_size=%s stderr=%r",
+            command_text,
+            completed.returncode,
+            elapsed,
+            output_tar,
+            size,
+            stderr,
+        )
+        if completed.returncode != 0 or size < 1024:
             output_tar.unlink(missing_ok=True)
             return False
         return True

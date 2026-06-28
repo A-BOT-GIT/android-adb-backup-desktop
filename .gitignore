@@ -13,3 +13,4 @@ dist/
 !AndroidBackupDesktop.spec
 AndroidBackups/
 *.zip
+backup.log
