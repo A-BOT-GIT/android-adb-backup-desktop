@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -55,13 +56,16 @@ class BackupService:
         self.adb = adb
         self.cancel_requested = False
         self.completed_apps: list[str] = []
+        self._completed_lock = threading.Lock()
 
     def request_cancel(self) -> None:
         self.cancel_requested = True
 
     def _check_cancel(self) -> None:
         if self.cancel_requested:
-            raise OperationCancelled("操作已取消。", completed_apps=list(self.completed_apps))
+            with self._completed_lock:
+                completed = list(self.completed_apps)
+            raise OperationCancelled("操作已取消。", completed_apps=completed)
 
     def backup_apps(
         self,
@@ -84,6 +88,14 @@ class BackupService:
             f"开始备份：应用数={len(apps)} include_data={options.include_data} include_obb={options.include_obb} 输出={zip_path}",
         )
 
+        loaded_apps: list[AppInfo] = []
+        for index, app in enumerate(apps, start=1):
+            if app.metadata_loaded:
+                loaded_apps.append(app)
+            else:
+                self._log(log, f"正在加载应用元数据 {index}/{len(apps)}：{app.package}")
+                loaded_apps.append(self.adb.load_app_metadata(app))
+
         with tempfile.TemporaryDirectory(prefix="android-app-backup-") as tmp_name:
             staging = Path(tmp_name)
             apps_dir = staging / "apps"
@@ -96,9 +108,9 @@ class BackupService:
                 "apps": [],
             }
 
-            total_steps = len(apps)
+            total_steps = len(loaded_apps)
             try:
-                for index, app in enumerate(apps, start=1):
+                for index, app in enumerate(loaded_apps, start=1):
                     self._check_cancel()
                     app_start = time.perf_counter()
                     if progress:
@@ -143,8 +155,9 @@ class BackupService:
                             "obb_files": obb_files,
                         }
                     )
-                    self.completed_apps.append(app.package)
-                    manifest["completed_apps"] = list(self.completed_apps)
+                    with self._completed_lock:
+                        self.completed_apps.append(app.package)
+                        manifest["completed_apps"] = list(self.completed_apps)
                     app_size = self._directory_size(app_dir)
                     elapsed = time.perf_counter() - app_start
                     self._log(
@@ -155,7 +168,9 @@ class BackupService:
                         progress(index, total_steps, f"已完成 {app.package}")
             except OperationCancelled as exc:
                 manifest["status"] = "cancelled"
-                manifest["completed_apps"] = list(self.completed_apps)
+                with self._completed_lock:
+                    completed = list(self.completed_apps)
+                manifest["completed_apps"] = completed
                 shutil.rmtree(apps_dir / ".tmp", ignore_errors=True)
                 (staging / "manifest.json").write_text(
                     json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -163,11 +178,11 @@ class BackupService:
                 )
                 self._zip_directory(staging, zip_path)
                 if progress:
-                    progress(len(self.completed_apps), total_steps, "已中断。")
-                self._log(log, f"备份已中断：已完成={len(self.completed_apps)}/{total_steps} 归档={zip_path}")
+                    progress(len(completed), total_steps, "已中断。")
+                self._log(log, f"备份已中断：已完成={len(completed)}/{total_steps} 归档={zip_path}")
                 raise OperationCancelled(
                     "备份已中断。",
-                    completed_apps=list(self.completed_apps),
+                    completed_apps=completed,
                     archive_path=zip_path,
                 ) from exc
 

@@ -23,6 +23,17 @@ class FakeBackupAdb:
     def path_exists(self, remote_path: str) -> bool:
         return False
 
+    def load_app_metadata(self, app: AppInfo) -> AppInfo:
+        return AppInfo(
+            package=app.package,
+            name=app.name or app.package,
+            version_name=app.version_name or "",
+            version_code=app.version_code or "",
+            apk_paths=app.apk_paths,
+            is_system=app.is_system,
+            metadata_loaded=True,
+        )
+
 
 def test_cancelled_backup_keeps_completed_apps_and_removes_tmp(tmp_path: Path) -> None:
     adb = FakeBackupAdb()
