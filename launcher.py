@@ -1,4 +1,5 @@
-"""Entry point for PyInstaller to launch the application as a module."""
-import runpy
+"""Entry point for PyInstaller - ensures module is properly discovered."""
+from android_backup_desktop.__main__ import main
 
-runpy.run_module("android_backup_desktop", run_name="__main__", alter_sys=True)
+if __name__ == "__main__":
+    raise SystemExit(main())
