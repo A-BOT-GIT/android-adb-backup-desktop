@@ -24,3 +24,6 @@ backup.log
 .serena/
 .worktrees/
 .polly/
+# PyInstaller local build output
+AndroidBackupDesktop.exe
+_internal/
