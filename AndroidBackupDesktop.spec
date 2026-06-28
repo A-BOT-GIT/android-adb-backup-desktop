@@ -6,8 +6,8 @@ from PyInstaller.utils.hooks import collect_all
 pyside6_datas, pyside6_binaries, pyside6_hiddenimports = collect_all("PySide6")
 
 a = Analysis(
-    ["src/android_backup_desktop/__main__.py"],
-    pathex=[],
+    ["launcher.py"],
+    pathex=["src"],
     binaries=pyside6_binaries,
     datas=[
         ("tools/adb", "tools/adb"),
