@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +30,9 @@ class AdbError(RuntimeError):
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 DEFAULT_ADB_NAMES = {"adb", "adb.exe"}
 LONG_ADB_OPERATION_TIMEOUT = 30 * 60
+BACKUP_CONFIRM_PACKAGES = ("com.android.backupconfirm", "com.google.android.backupconfirm")
+BACKUP_AUTO_CONFIRM_TIMEOUT = 20
+BACKUP_AUTO_CONFIRM_POLL_INTERVAL = 0.75
 
 
 def _is_default_adb_path(adb_path: str) -> bool:
@@ -438,13 +443,169 @@ class AdbClient:
             return
         self._run(["install-multiple", "-r", *[str(path) for path in apk_files]], timeout=LONG_ADB_OPERATION_TIMEOUT)
 
-    def adb_backup_package(self, package: str, output_file: Path, *, include_apk: bool = False) -> None:
+    def adb_backup_package(
+        self,
+        package: str,
+        output_file: Path,
+        *,
+        include_apk: bool = False,
+        auto_confirm: bool = False,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         apk_flag = "-apk" if include_apk else "-noapk"
-        self._run(["backup", "-f", str(output_file), apk_flag, package], timeout=180)
+        args = ["backup", "-f", str(output_file), apk_flag, package]
+        if not auto_confirm:
+            self._run(args, timeout=180)
+            return
+        self._run_backup_with_auto_confirm(args, timeout=180, log=log)
 
     def adb_restore(self, backup_file: Path) -> None:
         self._run(["restore", str(backup_file)], timeout=LONG_ADB_OPERATION_TIMEOUT)
+
+    def _run_backup_with_auto_confirm(
+        self,
+        args: list[str],
+        *,
+        timeout: int,
+        log: Callable[[str], None] | None,
+    ) -> None:
+        command = self._base_args() + args
+        command_text = " ".join(str(part) for part in command)
+        start = time.perf_counter()
+        logger.info("ADB begin: %s timeout=%s serial=%s auto_confirm=True", command_text, timeout, self.serial)
+
+        stop_event = threading.Event()
+        helper_thread = threading.Thread(
+            target=self._auto_confirm_backup_dialog,
+            args=(stop_event, log),
+            name="adb-backup-auto-confirm",
+            daemon=True,
+        )
+        helper_thread.start()
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except FileNotFoundError as exc:
+            stop_event.set()
+            helper_thread.join(timeout=1)
+            logger.exception("ADB failed: %s", command_text)
+            raise AdbError(f"未找到 ADB：{self.adb_path}") from exc
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout, stderr = process.communicate()
+            stop_event.set()
+            helper_thread.join(timeout=1)
+            elapsed = time.perf_counter() - start
+            logger.exception("ADB timeout after %.2fs: %s", elapsed, command_text)
+            raise AdbError(f"ADB 命令超时：{' '.join(command)}") from exc
+        finally:
+            stop_event.set()
+            helper_thread.join(timeout=2)
+
+        elapsed = time.perf_counter() - start
+        stdout_len = len(stdout or "")
+        stderr_len = len(stderr or "")
+        logger.info(
+            "ADB end: %s returncode=%s elapsed=%.2fs stdout_len=%d stderr_len=%d",
+            command_text,
+            process.returncode,
+            elapsed,
+            stdout_len,
+            stderr_len,
+        )
+        if process.returncode != 0:
+            message = (stderr or stdout or "未知 ADB 错误").strip()
+            raise AdbError(message)
+
+    def _auto_confirm_backup_dialog(
+        self,
+        stop_event: threading.Event,
+        log: Callable[[str], None] | None,
+    ) -> None:
+        deadline = time.monotonic() + BACKUP_AUTO_CONFIRM_TIMEOUT
+        tapped = False
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            if not self._backup_confirm_visible():
+                time.sleep(BACKUP_AUTO_CONFIRM_POLL_INTERVAL)
+                continue
+
+            x, y = self._resolve_backup_confirm_tap_point()
+            self.shell("input", "tap", str(x), str(y), timeout=15, check=False)
+            tapped = True
+            message = f"检测到系统备份确认页，已尝试自动点击确认按钮：({x}, {y})"
+            logger.info(message)
+            if log:
+                log(message)
+            time.sleep(1.0)
+
+        if not tapped:
+            logger.info("ADB backup auto confirm helper exited without sending shell tap")
+
+    def _backup_confirm_visible(self) -> bool:
+        output = self.shell("dumpsys", "window", "windows", timeout=15, check=False)
+        return any(package in output for package in BACKUP_CONFIRM_PACKAGES)
+
+    def _resolve_backup_confirm_tap_point(self) -> tuple[int, int]:
+        bounds = self._backup_confirm_button_bounds()
+        if bounds is not None:
+            left, top, right, bottom = bounds
+            return ((left + right) // 2, (top + bottom) // 2)
+
+        width, height = self._display_size()
+        return (int(width * 0.75), int(height * 0.585))
+
+    def _backup_confirm_button_bounds(self) -> tuple[int, int, int, int] | None:
+        dump_result = self._run(
+            ["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"],
+            timeout=15,
+            check=False,
+        )
+        if dump_result.returncode != 0:
+            return None
+
+        xml_result = self._run(
+            ["shell", "cat", "/sdcard/window_dump.xml"],
+            timeout=15,
+            check=False,
+        )
+        xml_text = xml_result.stdout.strip()
+        if not xml_text.startswith("<?xml"):
+            return None
+
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return None
+
+        for node in root.iter("node"):
+            if node.attrib.get("resource-id") != "com.android.backupconfirm:id/button_allow":
+                continue
+            bounds = node.attrib.get("bounds", "")
+            match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+            if not match:
+                continue
+            left, top, right, bottom = (int(value) for value in match.groups())
+            return (left, top, right, bottom)
+        return None
+
+    def _display_size(self) -> tuple[int, int]:
+        output = self.shell("wm", "size", timeout=10, check=False)
+        match = re.search(r"(?:Physical|Override) size:\s*(\d+)x(\d+)", output)
+        if match:
+            return (int(match.group(1)), int(match.group(2)))
+        return (1080, 1920)
 
     def restore_run_as_data(self, package: str, input_tar: Path) -> None:
         command = self._base_args() + [

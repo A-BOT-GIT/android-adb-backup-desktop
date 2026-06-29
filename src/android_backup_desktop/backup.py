@@ -87,7 +87,12 @@ class BackupService:
         operation_start = time.perf_counter()
         self._log(
             log,
-            f"开始备份：应用数={len(apps)} include_data={options.include_data} include_obb={options.include_obb} 输出={zip_path}",
+            "开始备份："
+            f"应用数={len(apps)} "
+            f"include_data={options.include_data} "
+            f"include_obb={options.include_obb} "
+            f"auto_confirm_adb_backup={options.auto_confirm_adb_backup} "
+            f"输出={zip_path}",
         )
 
         loaded_apps: list[AppInfo] = []
@@ -142,7 +147,7 @@ class BackupService:
                         data_files: list[str] = []
                         self._check_cancel()
                         if options.include_data:
-                            data_files = self._backup_data(app, tmp_app_dir / "data", log)
+                            data_files = self._backup_data(app, tmp_app_dir / "data", options, log)
 
                         obb_files: list[str] = []
                         self._check_cancel()
@@ -312,7 +317,13 @@ class BackupService:
             copied.append(self._backup_relative_path(local, apk_dir))
         return copied
 
-    def _backup_data(self, app: AppInfo, data_dir: Path, log: LogCallback | None) -> list[str]:
+    def _backup_data(
+        self,
+        app: AppInfo,
+        data_dir: Path,
+        options: BackupOptions,
+        log: LogCallback | None,
+    ) -> list[str]:
         self._check_cancel()
         data_dir.mkdir(parents=True, exist_ok=True)
         copied: list[str] = []
@@ -328,7 +339,13 @@ class BackupService:
         ab_file = data_dir / "adb-backup.ab"
         self._log(log, f"正在尝试通过 adb backup 备份 {app.package}；如设备提示，请在设备上确认。")
         try:
-            self.adb.adb_backup_package(app.package, ab_file, include_apk=False)
+            self.adb.adb_backup_package(
+                app.package,
+                ab_file,
+                include_apk=False,
+                auto_confirm=options.auto_confirm_adb_backup,
+                log=log,
+            )
         except AdbError as exc:
             self._log(log, f"已跳过 {app.package} 的数据备份：{exc}")
             ab_file.unlink(missing_ok=True)

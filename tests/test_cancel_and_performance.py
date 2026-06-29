@@ -179,6 +179,105 @@ def test_load_app_metadata_uses_localized_name_when_apk_reader_provides_it() -> 
     assert app.display_name == "示例应用"
 
 
+def test_adb_backup_package_uses_legacy_run_when_auto_confirm_disabled(tmp_path: Path) -> None:
+    client = AdbClient.__new__(AdbClient)
+    client.adb_path = Path("adb")
+    client.serial = "SER123"
+
+    calls: list[tuple[list[str], int | None]] = []
+
+    def fake_run(args: list[str], *, timeout: int | None = 60, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((args, timeout))
+
+        class Result:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+
+        return Result()
+
+    client._run = fake_run  # type: ignore[method-assign]
+
+    output_file = tmp_path / "backup.ab"
+    client.adb_backup_package("com.example.app", output_file, include_apk=False)
+
+    assert calls == [(["backup", "-f", str(output_file), "-noapk", "com.example.app"], 180)]
+
+
+def test_adb_backup_package_routes_to_auto_confirm_helper_when_enabled(tmp_path: Path) -> None:
+    client = AdbClient.__new__(AdbClient)
+    client.adb_path = Path("adb")
+    client.serial = "SER123"
+
+    helper_calls: list[tuple[list[str], int]] = []
+
+    def fake_helper(args: list[str], *, timeout: int, log=None):  # type: ignore[no-untyped-def]
+        helper_calls.append((args, timeout))
+
+    client._run_backup_with_auto_confirm = fake_helper  # type: ignore[method-assign]
+
+    output_file = tmp_path / "backup.ab"
+    client.adb_backup_package("com.example.app", output_file, include_apk=False, auto_confirm=True)
+
+    assert helper_calls == [(["backup", "-f", str(output_file), "-noapk", "com.example.app"], 180)]
+
+
+def test_backup_service_passes_auto_confirm_option_only_to_adb_backup(tmp_path: Path) -> None:
+    class FakeDataAdb:
+        def __init__(self) -> None:
+            self.adb_backup_calls: list[tuple[str, Path, bool, bool]] = []
+
+        def load_app_metadata(self, app: AppInfo) -> AppInfo:
+            return AppInfo(
+                package=app.package,
+                name=app.package,
+                apk_paths=app.apk_paths,
+                metadata_loaded=True,
+            )
+
+        def pull(self, remote: str, local: Path, timeout: int | None = None) -> None:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(b"apk")
+
+        def export_run_as_data(self, package: str, output_tar: Path) -> bool:
+            return False
+
+        def adb_backup_package(
+            self,
+            package: str,
+            output_file: Path,
+            *,
+            include_apk: bool = False,
+            auto_confirm: bool = False,
+            log=None,
+        ) -> None:
+            self.adb_backup_calls.append((package, output_file, include_apk, auto_confirm))
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_bytes(b"x" * 2048)
+
+        def path_exists(self, remote_path: str) -> bool:
+            return False
+
+    adb = FakeDataAdb()
+    service = BackupService(adb)  # type: ignore[arg-type]
+
+    zip_path = service.backup_apps(
+        [AppInfo(package="com.example.app", name="App", apk_paths=["/data/app/base.apk"])],
+        BackupOptions(
+            output_dir=tmp_path,
+            include_data=True,
+            include_obb=False,
+            auto_confirm_adb_backup=True,
+        ),
+    )
+
+    assert zip_path.exists()
+    assert adb.adb_backup_calls
+    assert adb.adb_backup_calls[0][0] == "com.example.app"
+    assert adb.adb_backup_calls[0][2] is False
+    assert adb.adb_backup_calls[0][3] is True
+
+
 def test_run_forces_utf8_subprocess_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
     from android_backup_desktop import adb as adb_module
 
@@ -230,6 +329,56 @@ def test_device_refresh_is_dispatched_to_background_worker(monkeypatch: pytest.M
     assert isinstance(captured["worker"], DeviceLoadWorker)
     assert captured["run_slot"] == captured["worker"].run
     window.close()
+
+
+def test_load_apps_worker_defaults_to_lazy_metadata_loading() -> None:
+    pytest.importorskip("PySide6")
+    from android_backup_desktop.gui import AppLoadWorker
+
+    worker = AppLoadWorker("adb", "SER123", include_system=False)
+
+    assert worker.preload_metadata is False
+
+
+def test_app_load_worker_preloads_metadata_when_enabled() -> None:
+    pytest.importorskip("PySide6")
+    from android_backup_desktop.gui import AppLoadWorker
+
+    class FakeAdbClient:
+        def __init__(self, adb_path: str, serial: str) -> None:
+            self.adb_path = adb_path
+            self.serial = serial
+
+        def list_apps(self, *, include_system: bool = False, progress=None, should_cancel=None):
+            return [
+                AppInfo(package="com.example.one", name="com.example.one", metadata_loaded=False),
+                AppInfo(package="com.example.two", name="com.example.two", metadata_loaded=False),
+            ]
+
+        def load_app_metadata(self, app: AppInfo) -> AppInfo:
+            return AppInfo(
+                package=app.package,
+                name=f"name-{app.package}",
+                localized_name=f"中文-{app.package}",
+                metadata_loaded=True,
+            )
+
+    import android_backup_desktop.gui as gui_module
+
+    original = gui_module.AdbClient
+    gui_module.AdbClient = FakeAdbClient  # type: ignore[assignment]
+    try:
+        worker = AppLoadWorker("adb", "SER123", include_system=False, preload_metadata=True)
+        captured: dict[str, object] = {}
+        worker.finished.connect(lambda apps: captured.setdefault("apps", apps))
+        worker.run()
+    finally:
+        gui_module.AdbClient = original  # type: ignore[assignment]
+
+    apps = captured["apps"]
+    assert len(apps) == 2
+    assert all(app.metadata_loaded for app in apps)
+    assert apps[0].localized_name == "中文-com.example.one"
 
 
 def test_fast_device_worker_result_is_handled_after_worker_setup(monkeypatch: pytest.MonkeyPatch) -> None:

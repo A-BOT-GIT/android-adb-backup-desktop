@@ -55,11 +55,18 @@ class AppLoadWorker(QObject):
     cancelled = Signal(list)
     log = Signal(str)
 
-    def __init__(self, adb_path: str, serial: str, include_system: bool) -> None:
+    def __init__(
+        self,
+        adb_path: str,
+        serial: str,
+        include_system: bool,
+        preload_metadata: bool = False,
+    ) -> None:
         super().__init__()
         self.adb_path = adb_path
         self.serial = serial
         self.include_system = include_system
+        self.preload_metadata = preload_metadata
         self.cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -76,6 +83,16 @@ class AppLoadWorker(QObject):
             if self.cancel_requested:
                 self.cancelled.emit(apps)
                 return
+            if self.preload_metadata:
+                loaded_apps: list[AppInfo] = []
+                total = len(apps)
+                for index, app in enumerate(apps, start=1):
+                    if self.cancel_requested:
+                        self.cancelled.emit(loaded_apps)
+                        return
+                    self.log.emit(f"正在解析应用名称 {index}/{total}：{app.package}")
+                    loaded_apps.append(adb.load_app_metadata(app))
+                apps = loaded_apps
             self.finished.emit(apps)
         except Exception as exc:
             self.failed.emit(str(exc) or "加载应用失败。")
@@ -197,9 +214,11 @@ class MainWindow(QMainWindow):
         self.device_combo = QComboBox()
 
         self.include_system = QCheckBox("显示系统应用")
+        self.preload_app_labels = QCheckBox("加载时解析所有应用名称")
         self.include_data = QCheckBox("在允许时包含应用数据")
         self.include_obb = QCheckBox("包含 OBB 文件")
         self.include_obb.setChecked(True)
+        self.auto_confirm_adb_backup = QCheckBox("ADB backup 时自动确认设备弹窗（实验性）")
         self.restore_data = QCheckBox("存在 .ab 数据时恢复")
         self.restore_data.setChecked(True)
 
@@ -254,9 +273,11 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.output_dir, 0, 1)
         options_layout.addWidget(self.browse_output_button, 0, 2)
         options_layout.addWidget(self.include_system, 1, 0)
-        options_layout.addWidget(self.include_data, 1, 1)
-        options_layout.addWidget(self.include_obb, 1, 2)
-        options_layout.addWidget(self.restore_data, 2, 1)
+        options_layout.addWidget(self.preload_app_labels, 1, 1)
+        options_layout.addWidget(self.include_data, 1, 2)
+        options_layout.addWidget(self.include_obb, 2, 0)
+        options_layout.addWidget(self.auto_confirm_adb_backup, 2, 1, 1, 2)
+        options_layout.addWidget(self.restore_data, 3, 1)
         layout.addWidget(options_group)
 
         toolbar = QHBoxLayout()
@@ -324,7 +345,12 @@ class MainWindow(QMainWindow):
             self.show_error("请先连接并选择一台 ADB 设备。")
             return
         self.set_busy(True, "正在加载应用...")
-        worker = AppLoadWorker(self.adb_path.text().strip() or "adb", serial, self.include_system.isChecked())
+        worker = AppLoadWorker(
+            self.adb_path.text().strip() or "adb",
+            serial,
+            self.include_system.isChecked(),
+            self.preload_app_labels.isChecked(),
+        )
         if not self.start_worker(worker, worker.run):
             return
         worker.log.connect(self.log)
@@ -447,6 +473,7 @@ class MainWindow(QMainWindow):
             output_dir=Path(self.output_dir.text()).expanduser(),
             include_data=self.include_data.isChecked(),
             include_obb=self.include_obb.isChecked(),
+            auto_confirm_adb_backup=self.auto_confirm_adb_backup.isChecked(),
         )
         self.set_busy(True, "正在开始备份...")
         worker = BackupWorker(self.adb_path.text().strip() or "adb", serial, apps, options)

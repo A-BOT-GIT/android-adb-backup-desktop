@@ -62,3 +62,4 @@ class BackupOptions:
     output_dir: Path
     include_data: bool = False
     include_obb: bool = True
+    auto_confirm_adb_backup: bool = False
